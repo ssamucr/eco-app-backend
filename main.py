@@ -19,7 +19,9 @@ from schemas import (
     FinanciamientoNuevo,
     LiquidacionObligacion,
     MovimientoSubcuenta,
+    MovimientoSubcuentaInicial,
     Obligacion,
+    ObligacionDeTransaccion,
     PagoCuota,
     Persona,
     PlanConDestinos,
@@ -502,26 +504,108 @@ def actualizar_cuenta(id_cuenta: int, cuenta: Cuenta):
     return actualizada
 
 
+def _marcadores(ids):
+    return ",".join("?" * len(ids))
+
+
 @app.delete("/cuentas/{id_cuenta}")
-def eliminar_cuenta(id_cuenta: int):
+def eliminar_cuenta(id_cuenta: int, en_cascada: bool = False):
     cuenta = fetch_one("SELECT nombre FROM cuentas WHERE id_cuenta = ?", (id_cuenta,))
     if not cuenta:
         raise _rechazar(404, "La cuenta no existe.")
+    nombre = "«%s»" % cuenta["nombre"]
+
+    # Las obligaciones y los planes recurrentes nunca se resuelven solos, ni siquiera en cascada.
     referencias = _contar_referencias(
         [
-            ("transacción", "transacciones",
-             "SELECT COUNT(*) FROM transacciones WHERE id_cuenta_origen = ? OR id_cuenta_destino = ?"),
-            ("subcuenta", "subcuentas", "SELECT COUNT(*) FROM subcuentas WHERE id_cuenta = ?"),
             ("obligación", "obligaciones",
              "SELECT COUNT(*) FROM obligaciones WHERE id_cuenta_destino_resolucion = ?"),
             ("plan recurrente", "planes recurrentes",
              "SELECT COUNT(*) FROM plan_recurrente_destinos WHERE id_cuenta_destino = ?"),
         ],
-        (id_cuenta, id_cuenta, id_cuenta, id_cuenta, id_cuenta),
+        (id_cuenta, id_cuenta),
     )
     if referencias:
-        raise _rechazar(409, _mensaje_bloqueo("«%s»" % cuenta["nombre"], referencias))
-    execute("DELETE FROM cuentas WHERE id_cuenta = ?", (id_cuenta,))
+        raise _rechazar(409, _mensaje_bloqueo(nombre, referencias))
+
+    if not en_cascada:
+        referencias = _contar_referencias(
+            [
+                ("transacción", "transacciones",
+                 "SELECT COUNT(*) FROM transacciones WHERE id_cuenta_origen = ? OR id_cuenta_destino = ?"),
+                ("subcuenta", "subcuentas", "SELECT COUNT(*) FROM subcuentas WHERE id_cuenta = ?"),
+            ],
+            (id_cuenta, id_cuenta, id_cuenta),
+        )
+        if referencias:
+            raise _rechazar(
+                409,
+                _mensaje_bloqueo(nombre, referencias) + " Puedes eliminarla junto con todos sus movimientos.",
+            )
+        execute("DELETE FROM cuentas WHERE id_cuenta = ?", (id_cuenta,))
+        return {"eliminado": True}
+
+    with transaccion() as cursor:
+        cursor.execute(
+            "SELECT id_transaccion FROM transacciones WHERE id_cuenta_origen = ? OR id_cuenta_destino = ?",
+            (id_cuenta, id_cuenta),
+        )
+        ids_transacciones = [fila[0] for fila in cursor.fetchall()]
+        cursor.execute("SELECT id_subcuenta FROM subcuentas WHERE id_cuenta = ?", (id_cuenta,))
+        ids_subcuentas = [fila[0] for fila in cursor.fetchall()]
+        ids_movimientos = []
+        if ids_subcuentas:
+            m = _marcadores(ids_subcuentas)
+            cursor.execute(
+                "SELECT id_movimiento_subcuenta FROM movimientos_subcuenta "
+                "WHERE id_subcuenta_origen IN (%s) OR id_subcuenta_destino IN (%s)" % (m, m),
+                ids_subcuentas + ids_subcuentas,
+            )
+            ids_movimientos = [fila[0] for fila in cursor.fetchall()]
+
+        bloqueadas = 0
+        if ids_transacciones:
+            m = _marcadores(ids_transacciones)
+            for tabla, columna in (
+                ("obligaciones", "id_transaccion_origen"),
+                ("liquidaciones_obligacion", "id_transaccion"),
+                ("financiamientos", "id_transaccion_origen"),
+                ("cuotas_financiamiento", "id_transaccion_pago"),
+            ):
+                cursor.execute("SELECT COUNT(*) FROM %s WHERE %s IN (%s)" % (tabla, columna, m), ids_transacciones)
+                bloqueadas += cursor.fetchone()[0]
+        if ids_movimientos:
+            m = _marcadores(ids_movimientos)
+            for tabla, columna in (
+                ("obligaciones", "id_movimiento_subcuenta_origen"),
+                ("liquidaciones_obligacion", "id_movimiento_subcuenta"),
+            ):
+                cursor.execute("SELECT COUNT(*) FROM %s WHERE %s IN (%s)" % (tabla, columna, m), ids_movimientos)
+                bloqueadas += cursor.fetchone()[0]
+        if bloqueadas:
+            raise _rechazar(
+                409,
+                "No se puede eliminar %s ni sus movimientos: alguno está vinculado a una obligación o un "
+                "financiamiento. Resuelve ese vínculo primero." % nombre,
+            )
+
+        if ids_transacciones:
+            m = _marcadores(ids_transacciones)
+            cursor.execute(
+                "UPDATE movimientos_subcuenta SET id_transaccion_relacionada = NULL "
+                "WHERE id_transaccion_relacionada IN (%s)" % m,
+                ids_transacciones,
+            )
+            cursor.execute("DELETE FROM transacciones WHERE id_transaccion IN (%s)" % m, ids_transacciones)
+        if ids_subcuentas:
+            m = _marcadores(ids_subcuentas)
+            cursor.execute(
+                "DELETE FROM movimientos_subcuenta WHERE id_subcuenta_origen IN (%s) OR id_subcuenta_destino IN (%s)"
+                % (m, m),
+                ids_subcuentas + ids_subcuentas,
+            )
+            cursor.execute("DELETE FROM subcuentas WHERE id_cuenta = ?", (id_cuenta,))
+        cursor.execute("DELETE FROM cuentas WHERE id_cuenta = ?", (id_cuenta,))
     return {"eliminado": True}
 
 
@@ -540,6 +624,7 @@ def _cuentas_detalle(id_cuenta=None):
     subcuentas_por_cuenta = {}
     for s in fetch_all(
         "SELECT s.id_subcuenta, s.id_cuenta, s.nombre, ISNULL(s.saldo, 0) AS saldo, s.saldo_meta, "
+        "ROW_NUMBER() OVER (PARTITION BY s.id_cuenta ORDER BY s.id_subcuenta) - 1 AS indice_color, "
         "s.descripcion, (SELECT COUNT(*) FROM movimientos_subcuenta m "
         "WHERE m.id_subcuenta_origen = s.id_subcuenta OR m.id_subcuenta_destino = s.id_subcuenta) AS movimientos "
         "FROM subcuentas s WHERE s.id_cuenta IS NOT NULL " + solo_sub +
@@ -578,6 +663,7 @@ def _cuentas_detalle(id_cuenta=None):
                     "saldo_meta": _num(s["saldo_meta"]) if s["saldo_meta"] is not None else None,
                     "descripcion": s["descripcion"],
                     "movimientos": s["movimientos"],
+                    "indice_color": s["indice_color"],
                     "porcentaje": _porcentaje(max(s["saldo"], Decimal(0)), base) or 0,
                 }
                 for s in subs
@@ -1056,6 +1142,32 @@ def _existe(cursor, sql, parametro, mensaje):
         raise _rechazar(422, mensaje)
 
 
+def _exigir_sin_asignar_transaccion(cursor, monto, origen, anterior=None):
+    """El saldo de las subcuentas de una cuenta nunca puede quedar por encima de su saldo real.
+
+    Se revisa al final, con la transaccion y sus movimientos de subcuenta vinculados ya aplicados: un gasto
+    que sale de la cuenta puede tomar de lo "sin asignar" o de una subcuenta (movimiento vinculado).
+    `anterior` (tipo, monto, id_cuenta_origen) es la transaccion que se reemplazo, al editar.
+    """
+    if origen is None:
+        return
+    cursor.execute("SELECT tipo FROM cuentas WHERE id_cuenta = ?", (origen,))
+    if cursor.fetchone()[0] == TARJETA:
+        return
+    extra = monto
+    if anterior and anterior[2] == origen:
+        extra -= anterior[1]
+    sin_asignar = _sin_asignar(cursor, origen)
+    if extra > 0 and sin_asignar < 0:
+        raise _rechazar(
+            422,
+            "Solo hay $%s sin asignar en esta cuenta: el resto está reservado en subcuentas. "
+            "Toma la diferencia de una subcuenta (movimiento de subcuenta de tipo gasto)." % format(
+                max(sin_asignar + extra, Decimal(0)), ",.2f"
+            ),
+        )
+
+
 def _validar_transaccion(cursor, datos):
     """Valida una transaccion segun su tipo; devuelve los valores ya normalizados."""
     if datos.tipo not in TIPOS_TRANSACCION:
@@ -1216,6 +1328,23 @@ def obtener_transaccion(id_transaccion: int):
     return fetch_one("SELECT * FROM transacciones WHERE id_transaccion = ?", (id_transaccion,))
 
 
+def _crear_obligacion_de_gasto(cursor, extra, id_transaccion, fecha, monto, descripcion):
+    obligacion = Obligacion(
+        fecha_creacion=fecha, tipo=extra.tipo, monto=float(extra.monto if extra.monto is not None else monto),
+        descripcion=extra.descripcion or descripcion or "Gasto", id_persona=extra.id_persona,
+        id_transaccion_origen=id_transaccion,
+        id_cuenta_destino_resolucion=extra.id_cuenta_destino_resolucion,
+        id_subcuenta_destino_resolucion=extra.id_subcuenta_destino_resolucion,
+    )
+    importe, concepto = _validar_obligacion(cursor, obligacion)
+    cursor.execute(
+        "INSERT INTO obligaciones (fecha_creacion, tipo, monto, descripcion, id_persona, id_transaccion_origen, "
+        "id_cuenta_destino_resolucion, id_subcuenta_destino_resolucion) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (fecha, obligacion.tipo, importe, concepto, obligacion.id_persona, id_transaccion,
+         obligacion.id_cuenta_destino_resolucion, obligacion.id_subcuenta_destino_resolucion),
+    )
+
+
 @app.post("/transacciones")
 def crear_transaccion(datos: TransaccionNueva):
     with transaccion() as cursor:
@@ -1229,6 +1358,11 @@ def crear_transaccion(datos: TransaccionNueva):
         creada = fila_actual(cursor)
         for movimiento in datos.movimientos_subcuenta:
             _crear_movimiento_vinculado(cursor, movimiento, fecha, creada["id_transaccion"])
+        _exigir_sin_asignar_transaccion(cursor, monto, origen)
+        if datos.obligacion is not None:
+            if tipo != "GASTO":
+                raise _rechazar(422, "Solo un gasto puede crear una obligación junto con él.")
+            _crear_obligacion_de_gasto(cursor, datos.obligacion, creada["id_transaccion"], fecha, monto, descripcion)
         return creada
 
 
@@ -1241,8 +1375,11 @@ def actualizar_transaccion(id_transaccion: int, datos: TransaccionEditar):
             raise _rechazar(409, _mensaje_bloqueo("uno de los movimientos de subcuenta", bloqueo))
 
     with transaccion() as cursor:
-        cursor.execute("SELECT 1 FROM transacciones WHERE id_transaccion = ?", (id_transaccion,))
-        if not cursor.fetchone():
+        cursor.execute(
+            "SELECT tipo, monto, id_cuenta_origen FROM transacciones WHERE id_transaccion = ?", (id_transaccion,)
+        )
+        anterior = cursor.fetchone()
+        if not anterior:
             raise _rechazar(404, "El movimiento no existe.")
         fecha, tipo, monto, origen, destino, categoria, descripcion, referencia = _validar_transaccion(cursor, datos)
 
@@ -1267,6 +1404,7 @@ def actualizar_transaccion(id_transaccion: int, datos: TransaccionEditar):
         actualizada = fila_actual(cursor)
         for movimiento in datos.agregar_movimientos_subcuenta:
             _crear_movimiento_vinculado(cursor, movimiento, fecha, id_transaccion)
+        _exigir_sin_asignar_transaccion(cursor, monto, origen, anterior)
         return actualizada
 
 
@@ -1460,16 +1598,11 @@ def listar_movimientos_subcuenta_detalle(limite: int = 50, pagina: int = 0):
 @app.get("/movimientos-opciones")
 def obtener_opciones_movimiento():
     """Datos para los selectores de los formularios: cuentas (con subcuentas y saldos), categorias y recientes."""
-    recientes = fetch_all(
-        "SELECT TOP 60 id_transaccion, fecha, tipo, monto, descripcion FROM transacciones "
-        "ORDER BY fecha DESC, id_transaccion DESC"
-    )
-    for r in recientes:
-        r["monto"] = _num(r["monto"])
     return {
         "cuentas": _cuentas_detalle(),
         "categorias": fetch_all("SELECT id_categoria, nombre FROM categorias ORDER BY nombre"),
-        "transacciones_recientes": recientes,
+        "personas": fetch_all("SELECT id_persona, nombre FROM personas ORDER BY nombre"),
+        "transacciones_recientes": _transacciones_recientes(60),
     }
 
 
@@ -1651,19 +1784,27 @@ def obtener_obligacion_detalle(id_obligacion: int):
     return obligacion
 
 
-@app.get("/obligaciones-opciones")
-def obtener_opciones_obligacion():
-    """Selectores de los formularios de obligacion y liquidacion."""
+def _transacciones_recientes(limite=300):
+    """Las ultimas transacciones con sus cuentas ya resueltas, para los selectores de vinculo."""
     recientes = fetch_all(
-        "SELECT TOP 60 id_transaccion, fecha, tipo, monto, descripcion FROM transacciones "
-        "ORDER BY fecha DESC, id_transaccion DESC"
+        "SELECT TOP %d t.id_transaccion, t.fecha, t.tipo, t.monto, t.descripcion, "
+        "origen.nombre AS cuenta_origen, destino.nombre AS cuenta_destino "
+        "FROM transacciones t LEFT JOIN cuentas origen ON origen.id_cuenta = t.id_cuenta_origen "
+        "LEFT JOIN cuentas destino ON destino.id_cuenta = t.id_cuenta_destino "
+        "ORDER BY t.fecha DESC, t.id_transaccion DESC" % limite
     )
     for r in recientes:
         r["monto"] = _num(r["monto"])
+    return recientes
+
+
+@app.get("/obligaciones-opciones")
+def obtener_opciones_obligacion():
+    """Selectores de los formularios de obligacion y liquidacion."""
     return {
         "personas": fetch_all("SELECT id_persona, nombre FROM personas ORDER BY nombre"),
         "cuentas": _cuentas_detalle(),
-        "transacciones_recientes": recientes,
+        "transacciones_recientes": _transacciones_recientes(),
         "movimientos_subcuenta_recientes": _movimientos_subcuenta_detalle(
             "", (0, 60), "ORDER BY m.fecha DESC, m.id_movimiento_subcuenta DESC OFFSET ? ROWS FETCH NEXT ? ROWS ONLY"
         ),
@@ -1913,13 +2054,13 @@ def obtener_opciones_financiamiento():
         "JOIN cuentas c ON c.id_cuenta = t.id_cuenta_origen WHERE c.tipo = 'TARJETA_CREDITO' AND t.tipo = 'GASTO' "
         "ORDER BY t.fecha DESC, t.id_transaccion DESC"
     )
-    recientes = fetch_all(
-        "SELECT TOP 60 id_transaccion, fecha, tipo, monto, descripcion FROM transacciones "
-        "ORDER BY fecha DESC, id_transaccion DESC"
-    )
-    for fila in compras + recientes:
+    for fila in compras:
         fila["monto"] = _num(fila["monto"])
-    return {"compras_tarjeta": compras, "transacciones_recientes": recientes}
+    return {
+        "compras_tarjeta": compras,
+        "transacciones_recientes": _transacciones_recientes(),
+        "cuentas": _cuentas_detalle(),
+    }
 
 
 # ---------- cuotas_financiamiento ----------
@@ -1962,9 +2103,13 @@ def obtener_cuota_detalle(id_cuota: int):
     cuota = fetch_one(
         "SELECT q.id_cuota_financiamiento, q.id_financiamiento, q.numero_cuota, q.fecha_vencimiento, q.monto, "
         "q.fecha_pago, q.id_transaccion_pago, f.descripcion AS financiamiento, f.numero_cuotas, "
-        "t.descripcion AS transaccion_pago, t.fecha AS fecha_transaccion_pago "
+        "t.descripcion AS transaccion_pago, t.fecha AS fecha_transaccion_pago, "
+        "origen.id_cuenta_origen AS id_tarjeta, tarjeta.nombre AS tarjeta "
         "FROM cuotas_financiamiento q JOIN financiamientos f ON f.id_financiamiento = q.id_financiamiento "
-        "LEFT JOIN transacciones t ON t.id_transaccion = q.id_transaccion_pago WHERE q.id_cuota_financiamiento = ?",
+        "LEFT JOIN transacciones t ON t.id_transaccion = q.id_transaccion_pago "
+        "LEFT JOIN transacciones origen ON origen.id_transaccion = f.id_transaccion_origen "
+        "LEFT JOIN cuentas tarjeta ON tarjeta.id_cuenta = origen.id_cuenta_origen "
+        "WHERE q.id_cuota_financiamiento = ?",
         (id_cuota,),
     )
     if not cuota:
@@ -2011,11 +2156,47 @@ def eliminar_cuota_financiamiento(id_cuota: int):
     return {"eliminado": True}
 
 
+def _generar_pago_cuota(cursor, pago, monto, cuota_texto, id_tarjeta_origen):
+    """Crea el pago a la tarjeta de una cuota (y el gasto de subcuenta si sale de una); devuelve su id."""
+    id_tarjeta = pago.id_tarjeta or id_tarjeta_origen
+    if id_tarjeta is None:
+        raise _rechazar(422, "Elige la tarjeta que se paga: este financiamiento no tiene una compra de origen.")
+    datos = TransaccionNueva(
+        fecha=pago.fecha_pago, tipo="PAGO_TARJETA", monto=float(monto),
+        id_cuenta_origen=pago.id_cuenta_origen, id_cuenta_destino=id_tarjeta,
+        descripcion=cuota_texto[:LIMITE_DESCRIPCION],
+    )
+    fecha, tipo, monto, origen, destino, categoria, descripcion, referencia = _validar_transaccion(cursor, datos)
+    cursor.execute(
+        "INSERT INTO transacciones "
+        "(fecha, tipo, monto, id_cuenta_origen, id_cuenta_destino, id_categoria, descripcion, referencia) "
+        "OUTPUT INSERTED.id_transaccion VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (fecha, tipo, monto, origen, destino, categoria, descripcion, referencia),
+    )
+    id_transaccion = cursor.fetchone()[0]
+    if pago.id_subcuenta_origen is not None:
+        _crear_movimiento_vinculado(
+            cursor,
+            MovimientoSubcuentaInicial(
+                tipo="GASTO", monto=float(monto), id_subcuenta_origen=pago.id_subcuenta_origen,
+                descripcion=cuota_texto[:LIMITE_DESCRIPCION],
+            ),
+            fecha, id_transaccion,
+        )
+    _exigir_sin_asignar_transaccion(cursor, monto, origen)
+    return id_transaccion
+
+
 @app.post("/cuotas-financiamiento/{id_cuota}/pagar")
 def pagar_cuota_financiamiento(id_cuota: int, pago: PagoCuota):
+    """Marca la cuota como pagada. Con `id_cuenta_origen` genera ademas el pago a la tarjeta."""
     with transaccion() as cursor:
         cursor.execute(
-            "SELECT monto, fecha_pago FROM cuotas_financiamiento WHERE id_cuota_financiamiento = ?", (id_cuota,)
+            "SELECT q.monto, q.fecha_pago, q.numero_cuota, f.numero_cuotas, f.descripcion, t.id_cuenta_origen "
+            "FROM cuotas_financiamiento q JOIN financiamientos f ON f.id_financiamiento = q.id_financiamiento "
+            "LEFT JOIN transacciones t ON t.id_transaccion = f.id_transaccion_origen "
+            "WHERE q.id_cuota_financiamiento = ?",
+            (id_cuota,),
         )
         cuota = cursor.fetchone()
         if not cuota:
@@ -2025,33 +2206,73 @@ def pagar_cuota_financiamiento(id_cuota: int, pago: PagoCuota):
         monto = _dinero(pago.monto) if pago.monto is not None else cuota[0]
         if monto <= 0:
             raise _rechazar(422, "El monto debe ser mayor que 0.")
-        if pago.id_transaccion_pago is not None:
-            _existe(cursor, "SELECT 1 FROM transacciones WHERE id_transaccion = ?", pago.id_transaccion_pago,
+        if pago.id_transaccion_pago is not None and pago.id_cuenta_origen is not None:
+            raise _rechazar(422, "Elige vincular un pago existente o generar uno nuevo, no ambos.")
+        id_transaccion = pago.id_transaccion_pago
+        if id_transaccion is not None:
+            _existe(cursor, "SELECT 1 FROM transacciones WHERE id_transaccion = ?", id_transaccion,
                     "La transacción de pago no existe.")
+        elif pago.id_cuenta_origen is not None:
+            texto = "Cuota %d de %d · %s" % (cuota[2], cuota[3], cuota[4])
+            id_transaccion = _generar_pago_cuota(cursor, pago, monto, texto, cuota[5])
         # Si se paga un monto distinto, la cuota queda con lo que realmente se pago.
         cursor.execute(
             "UPDATE cuotas_financiamiento SET fecha_pago = ?, id_transaccion_pago = ?, monto = ? "
             "OUTPUT INSERTED.* WHERE id_cuota_financiamiento = ?",
-            (pago.fecha_pago, pago.id_transaccion_pago, monto, id_cuota),
+            (pago.fecha_pago, id_transaccion, monto, id_cuota),
         )
         return fila_actual(cursor)
 
 
 @app.post("/cuotas-financiamiento/{id_cuota}/deshacer-pago")
-def deshacer_pago_cuota(id_cuota: int):
+def deshacer_pago_cuota(id_cuota: int, eliminar_pago: bool = False):
+    """Deja la cuota pendiente. Con `eliminar_pago` borra tambien la transaccion de pago (y sus movimientos de subcuenta)."""
     with transaccion() as cursor:
-        cursor.execute("SELECT fecha_pago FROM cuotas_financiamiento WHERE id_cuota_financiamiento = ?", (id_cuota,))
+        cursor.execute(
+            "SELECT fecha_pago, id_transaccion_pago FROM cuotas_financiamiento WHERE id_cuota_financiamiento = ?",
+            (id_cuota,),
+        )
         cuota = cursor.fetchone()
         if not cuota:
             raise _rechazar(404, "La cuota no existe.")
         if cuota[0] is None:
             raise _rechazar(409, "Esta cuota no está pagada.")
+        id_transaccion = cuota[1]
         cursor.execute(
             "UPDATE cuotas_financiamiento SET fecha_pago = NULL, id_transaccion_pago = NULL "
             "OUTPUT INSERTED.* WHERE id_cuota_financiamiento = ?",
             (id_cuota,),
         )
-        return fila_actual(cursor)
+        actualizada = fila_actual(cursor)
+        if eliminar_pago and id_transaccion is not None:
+            for tabla, columna in (
+                ("obligaciones", "id_transaccion_origen"),
+                ("liquidaciones_obligacion", "id_transaccion"),
+                ("financiamientos", "id_transaccion_origen"),
+                ("cuotas_financiamiento", "id_transaccion_pago"),
+            ):
+                cursor.execute("SELECT COUNT(*) FROM %s WHERE %s = ?" % (tabla, columna), (id_transaccion,))
+                if cursor.fetchone()[0]:
+                    raise _rechazar(409, "No se puede eliminar el pago: está vinculado a una obligación, "
+                                         "financiamiento u otra cuota.")
+            cursor.execute(
+                "SELECT id_movimiento_subcuenta, monto, id_subcuenta_origen, id_subcuenta_destino "
+                "FROM movimientos_subcuenta WHERE id_transaccion_relacionada = ?",
+                (id_transaccion,),
+            )
+            for id_mov, monto, origen, destino in cursor.fetchall():
+                cursor.execute(
+                    "SELECT (SELECT COUNT(*) FROM obligaciones WHERE id_movimiento_subcuenta_origen = ?) + "
+                    "(SELECT COUNT(*) FROM liquidaciones_obligacion WHERE id_movimiento_subcuenta = ?)",
+                    (id_mov, id_mov),
+                )
+                if cursor.fetchone()[0]:
+                    raise _rechazar(409, "No se puede eliminar el pago: un movimiento de subcuenta vinculado "
+                                         "está en uso.")
+                _revertir_movimiento_subcuenta(cursor, monto, origen, destino)
+                cursor.execute("DELETE FROM movimientos_subcuenta WHERE id_movimiento_subcuenta = ?", (id_mov,))
+            cursor.execute("DELETE FROM transacciones WHERE id_transaccion = ?", (id_transaccion,))
+        return actualizada
 
 
 # ---------- vistas (solo lectura) ----------
@@ -2146,7 +2367,8 @@ def _desglose_subcuentas(saldo_cuenta, subcuentas):
     if not subcuentas:
         return None
     segmentos = [
-        {"tipo": "subcuenta", "nombre": s["nombre"] or "Sin nombre", "saldo": s["saldo"]}
+        {"tipo": "subcuenta", "nombre": s["nombre"] or "Sin nombre", "saldo": s["saldo"],
+         "indice_color": s["indice_color"]}
         for s in subcuentas[:MAX_SUBCUENTAS]
     ]
     resto = subcuentas[MAX_SUBCUENTAS:]
@@ -2161,7 +2383,7 @@ def _desglose_subcuentas(saldo_cuenta, subcuentas):
     total = sum((s["saldo"] for s in segmentos), Decimal(0))
     return [
         {"tipo": s["tipo"], "nombre": s["nombre"], "saldo": _num(s["saldo"]),
-         "porcentaje": _porcentaje(s["saldo"], total)}
+         "porcentaje": _porcentaje(s["saldo"], total), "indice_color": s.get("indice_color")}
         for s in segmentos
     ]
 
@@ -2169,8 +2391,9 @@ def _desglose_subcuentas(saldo_cuenta, subcuentas):
 def _resumen_cuentas(cuentas):
     subcuentas_por_cuenta = {}
     for s in fetch_all(
-        "SELECT id_cuenta, nombre, saldo FROM subcuentas "
-        "WHERE id_cuenta IS NOT NULL AND saldo > 0 ORDER BY saldo DESC"
+        "SELECT * FROM (SELECT id_subcuenta, id_cuenta, nombre, saldo, "
+        "ROW_NUMBER() OVER (PARTITION BY id_cuenta ORDER BY id_subcuenta) - 1 AS indice_color "
+        "FROM subcuentas WHERE id_cuenta IS NOT NULL) x WHERE saldo > 0 ORDER BY saldo DESC"
     ):
         subcuentas_por_cuenta.setdefault(s["id_cuenta"], []).append(s)
 

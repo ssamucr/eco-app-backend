@@ -98,8 +98,19 @@ class MovimientoSubcuentaInicial(BaseModel):
     descripcion: Optional[str] = None
 
 
+class ObligacionDeTransaccion(BaseModel):
+    """Obligacion que se crea junto con un gasto: toma de el la fecha, el monto y el concepto si no se indican."""
+    tipo: str
+    id_persona: Optional[int] = None
+    descripcion: Optional[str] = None
+    monto: Optional[float] = None
+    id_cuenta_destino_resolucion: int
+    id_subcuenta_destino_resolucion: Optional[int] = None
+
+
 class TransaccionNueva(Transaccion):
     movimientos_subcuenta: List[MovimientoSubcuentaInicial] = []
+    obligacion: Optional[ObligacionDeTransaccion] = None
 
 
 class TransaccionEditar(Transaccion):
@@ -141,7 +152,13 @@ class CalendarioFinanciamiento(BaseModel):
 class PagoCuota(BaseModel):
     fecha_pago: date
     monto: Optional[float] = None
+    # Para vincular un pago que ya registraste...
     id_transaccion_pago: Optional[int] = None
+    # ...o para que se genere el pago a la tarjeta desde esta cuenta (y subcuenta, si sale de una).
+    id_cuenta_origen: Optional[int] = None
+    id_subcuenta_origen: Optional[int] = None
+    # Solo si el financiamiento no tiene una compra de origen de la que deducir la tarjeta.
+    id_tarjeta: Optional[int] = None
 
 
 class CuotaFinanciamiento(BaseModel):
