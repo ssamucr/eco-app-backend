@@ -356,7 +356,7 @@ LEFT JOIN (
 GO
 
 -- ---------------------------------------------------------------------------------------------------
--- Ciclos (periodos entre pagas). Mismo contenido que migraciones/001_ciclos.sql.
+-- Ciclos (periodos entre pagas).
 -- ---------------------------------------------------------------------------------------------------
 
 IF OBJECT_ID('dbo.ciclo_config', 'U') IS NULL

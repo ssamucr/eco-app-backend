@@ -29,8 +29,6 @@ Hecha con **FastAPI** + **SQL Server** (`pyodbc`). El frontend vive en
    sqlcmd -S localhost\SQLEXPRESS -E -i database\usuario.sql
    ```
 
-   Si ya tenías la base creada antes de los ciclos, basta con ejecutar `migraciones/001_ciclos.sql`.
-
 2. Instala las dependencias:
 
    ```bash
@@ -58,4 +56,3 @@ Hecha con **FastAPI** + **SQL Server** (`pyodbc`). El frontend vive en
 
 - `database/eco.sql`: esquema completo (estructura, sin datos). Es la referencia para crear la base desde cero.
 - `database/usuario.sql`: crea el usuario de la aplicación (hay que poner tu propia contraseña).
-- `migraciones/`: cambios incrementales para bases que ya existen.

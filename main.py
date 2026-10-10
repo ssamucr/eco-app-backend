@@ -3,6 +3,7 @@ import re
 from contextlib import contextmanager
 from datetime import date, timedelta
 from decimal import ROUND_DOWN, Decimal
+from typing import Optional
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -11,6 +12,8 @@ from db import get_connection
 from schemas import (
     CalendarioFinanciamiento,
     Categoria,
+    CicloAjuste,
+    CicloConfig,
     Cuenta,
     CuentaNueva,
     CuotaFinanciamiento,
@@ -1526,15 +1529,30 @@ def eliminar_movimiento_subcuenta(id_movimiento: int):
 
 # ---------- movimientos (lectura para la pantalla Movimientos) ----------
 
+def _filtro_fechas(columna, desde, hasta):
+    """WHERE opcional para limitar una lista a un rango de fechas (inclusive)."""
+    condiciones, parametros = [], ()
+    if desde is not None:
+        condiciones.append("%s >= ?" % columna)
+        parametros += (desde,)
+    if hasta is not None:
+        condiciones.append("%s <= ?" % columna)
+        parametros += (hasta,)
+    return ("WHERE " + " AND ".join(condiciones) + " " if condiciones else ""), parametros
+
+
 def _pagina(limite, pagina):
     limite = min(max(limite, 1), 200)
     return limite, max(pagina, 0) * limite
 
 
 @app.get("/movimientos-detalle")
-def listar_movimientos_detalle(limite: int = 50, pagina: int = 0):
-    """Transacciones de la mas reciente a la mas antigua, con nombres ya resueltos."""
+def listar_movimientos_detalle(
+    limite: int = 50, pagina: int = 0, desde: Optional[date] = None, hasta: Optional[date] = None
+):
+    """Transacciones de la mas reciente a la mas antigua, con nombres ya resueltos (opcionalmente entre dos fechas)."""
     limite, desplazamiento = _pagina(limite, pagina)
+    filtro, parametros = _filtro_fechas("t.fecha", desde, hasta)
     movimientos = fetch_all(
         "SELECT t.id_transaccion, t.fecha, t.tipo, t.monto, t.descripcion, t.referencia, "
         "categorias.nombre AS categoria, origen.nombre AS cuenta_origen, destino.nombre AS cuenta_destino, "
@@ -1543,13 +1561,13 @@ def listar_movimientos_detalle(limite: int = 50, pagina: int = 0):
         "FROM transacciones t "
         "LEFT JOIN categorias ON categorias.id_categoria = t.id_categoria "
         "LEFT JOIN cuentas origen ON origen.id_cuenta = t.id_cuenta_origen "
-        "LEFT JOIN cuentas destino ON destino.id_cuenta = t.id_cuenta_destino "
+        "LEFT JOIN cuentas destino ON destino.id_cuenta = t.id_cuenta_destino " + filtro +
         "ORDER BY t.fecha DESC, t.id_transaccion DESC OFFSET ? ROWS FETCH NEXT ? ROWS ONLY",
-        (desplazamiento, limite),
+        parametros + (desplazamiento, limite),
     )
     for m in movimientos:
         m["monto"] = _num(m["monto"])
-    total = fetch_one("SELECT COUNT(*) AS total FROM transacciones")["total"]
+    total = fetch_one("SELECT COUNT(*) AS total FROM transacciones t " + filtro, parametros)["total"]
     return {"total": total, "movimientos": movimientos}
 
 
@@ -1586,13 +1604,16 @@ def _movimientos_subcuenta_detalle(filtro, parametros, orden="ORDER BY m.fecha D
 
 
 @app.get("/movimientos-subcuenta-detalle")
-def listar_movimientos_subcuenta_detalle(limite: int = 50, pagina: int = 0):
+def listar_movimientos_subcuenta_detalle(
+    limite: int = 50, pagina: int = 0, desde: Optional[date] = None, hasta: Optional[date] = None
+):
     limite, desplazamiento = _pagina(limite, pagina)
+    filtro, parametros = _filtro_fechas("m.fecha", desde, hasta)
     filas = _movimientos_subcuenta_detalle(
-        "", (desplazamiento, limite),
+        filtro, parametros + (desplazamiento, limite),
         "ORDER BY m.fecha DESC, m.id_movimiento_subcuenta DESC OFFSET ? ROWS FETCH NEXT ? ROWS ONLY",
     )
-    total = fetch_one("SELECT COUNT(*) AS total FROM movimientos_subcuenta")["total"]
+    total = fetch_one("SELECT COUNT(*) AS total FROM movimientos_subcuenta m " + filtro, parametros)["total"]
     return {"total": total, "movimientos": filas}
 
 
@@ -2490,6 +2511,308 @@ def listar_estado_obligaciones():
     return fetch_all("SELECT * FROM vw_estado_obligaciones")
 
 
+# ---------- ciclos ----------
+
+AJUSTES_FIN_SEMANA = ("NINGUNO", "ANTERIOR", "SIGUIENTE")
+LIMITE_NOMBRE_CICLO = 30
+DIAS_ADELANTE = 70  # hasta donde se generan ciclos hacia el futuro
+
+
+def _ajustar_fin_semana(fecha, ajuste):
+    """Si `fecha` cae en sabado o domingo, la mueve al dia habil anterior o siguiente."""
+    dia = fecha.weekday()  # 5 = sabado, 6 = domingo
+    if dia < 5 or ajuste == "NINGUNO":
+        return fecha
+    return fecha - timedelta(days=dia - 4) if ajuste == "ANTERIOR" else fecha + timedelta(days=7 - dia)
+
+
+def _inicios_nominales(dias, ajuste, desde, hasta):
+    """Fechas de inicio de ciclo (ya ajustadas por fin de semana) entre `desde` y `hasta`, en orden."""
+    inicios = set()
+    anio, mes = desde.year, desde.month
+    # Un mes de margen a cada lado: el ajuste de fin de semana puede cruzar el limite del mes.
+    mes -= 1
+    if mes == 0:
+        anio, mes = anio - 1, 12
+    while date(anio, mes, 1) <= hasta + timedelta(days=31):
+        ultimo = calendar.monthrange(anio, mes)[1]
+        for dia in dias:
+            fecha = _ajustar_fin_semana(date(anio, mes, min(dia, ultimo)), ajuste)
+            if desde <= fecha <= hasta:
+                inicios.add(fecha)
+        mes += 1
+        if mes == 13:
+            anio, mes = anio + 1, 1
+    return sorted(inicios)
+
+
+def _cargar_config(cursor, id_config):
+    cursor.execute(
+        "SELECT nombre, ajuste_fin_semana, es_principal, activo FROM ciclo_config WHERE id_ciclo_config = ?",
+        (id_config,),
+    )
+    fila = cursor.fetchone()
+    if not fila:
+        raise _rechazar(404, "La configuración de ciclos no existe.")
+    cursor.execute("SELECT dia FROM ciclo_config_dia WHERE id_ciclo_config = ? ORDER BY dia", (id_config,))
+    return {
+        "id_ciclo_config": id_config, "nombre": fila[0], "ajuste_fin_semana": fila[1],
+        "es_principal": bool(fila[2]), "activo": bool(fila[3]), "dias": [d[0] for d in cursor.fetchall()],
+    }
+
+
+def _generar_ciclos(cursor, id_config):
+    """Completa los ciclos de una configuracion: desde la primera transaccion hasta unos dias en el futuro.
+
+    Los ciclos ya guardados (incluidos los ajustados a mano) no se tocan: solo se agregan los que faltan,
+    siempre pegados a los existentes.
+    """
+    config = _cargar_config(cursor, id_config)
+    if not config["dias"]:
+        return
+    dias, ajuste = config["dias"], config["ajuste_fin_semana"]
+    hoy = date.today()
+    cursor.execute("SELECT MIN(fecha) FROM transacciones")
+    primera = cursor.fetchone()[0] or hoy
+    objetivo = hoy + timedelta(days=DIAS_ADELANTE)
+    cursor.execute(
+        "SELECT fecha_inicio, fecha_fin FROM ciclo WHERE id_ciclo_config = ? ORDER BY fecha_inicio", (id_config,)
+    )
+    existentes = cursor.fetchall()
+    nuevos = []
+
+    def pares(limites):
+        for i in range(len(limites) - 1):
+            if limites[i] <= objetivo:
+                nuevos.append((limites[i], limites[i + 1] - timedelta(days=1)))
+
+    if not existentes:
+        inicios = _inicios_nominales(dias, ajuste, primera - timedelta(days=62), objetivo + timedelta(days=62))
+        previos = [i for i in inicios if i <= primera]
+        comienzo = previos[-1] if previos else inicios[0]
+        pares([i for i in inicios if i >= comienzo])
+    else:
+        primero, ultimo = existentes[0][0], existentes[-1][1]
+        if primera < primero:
+            candidatos = [i for i in _inicios_nominales(dias, ajuste, primera - timedelta(days=62), primero - timedelta(days=1))]
+            if candidatos:
+                base = [i for i in candidatos if i <= primera]
+                comienzo = base[-1] if base else candidatos[0]
+                pares([i for i in candidatos if i >= comienzo] + [primero])
+        if ultimo < objetivo:
+            arranque = ultimo + timedelta(days=1)
+            pares([arranque] + _inicios_nominales(dias, ajuste, arranque + timedelta(days=1), objetivo + timedelta(days=62)))
+    for inicio, fin in nuevos:
+        cursor.execute(
+            "INSERT INTO ciclo (id_ciclo_config, fecha_inicio, fecha_fin, ajustado) VALUES (?, ?, ?, 0)",
+            (id_config, inicio, fin),
+        )
+
+
+def _asegurar_ciclos():
+    """Genera los ciclos que falten de todas las configuraciones activas."""
+    configs = fetch_all("SELECT id_ciclo_config FROM ciclo_config WHERE activo = 1")
+    if not configs:
+        return
+    with transaccion() as cursor:
+        for c in configs:
+            _generar_ciclos(cursor, c["id_ciclo_config"])
+
+
+def _validar_config_ciclo(cursor, datos, id_actual=None):
+    nombre = _nombre_requerido(datos.nombre, LIMITE_NOMBRE_CICLO, "El nombre")
+    _exigir_nombre_libre("ciclo_config", "id_ciclo_config", nombre, id_actual, "Ya existe una configuración con ese nombre.")
+    if datos.ajuste_fin_semana not in AJUSTES_FIN_SEMANA:
+        raise _rechazar(422, "El ajuste de fin de semana no es válido.")
+    dias = sorted(set(datos.dias))
+    if not dias:
+        raise _rechazar(422, "Elige al menos un día del mes.")
+    if any(d < 1 or d > 31 for d in dias):
+        raise _rechazar(422, "Los días deben estar entre 1 y 31.")
+    return nombre, dias
+
+
+def _guardar_dias(cursor, id_config, dias):
+    cursor.execute("DELETE FROM ciclo_config_dia WHERE id_ciclo_config = ?", (id_config,))
+    for dia in dias:
+        cursor.execute("INSERT INTO ciclo_config_dia (id_ciclo_config, dia) VALUES (?, ?)", (id_config, dia))
+
+
+def _config_ciclos_detalle(id_config=None):
+    filtro = "WHERE c.id_ciclo_config = ? " if id_config is not None else ""
+    configs = fetch_all(
+        "SELECT c.id_ciclo_config, c.nombre, c.ajuste_fin_semana, c.es_principal, c.activo FROM ciclo_config c "
+        + filtro + "ORDER BY c.es_principal DESC, c.nombre",
+        (id_config,) if id_config is not None else (),
+    )
+    dias = {}
+    for d in fetch_all("SELECT id_ciclo_config, dia FROM ciclo_config_dia ORDER BY dia"):
+        dias.setdefault(d["id_ciclo_config"], []).append(d["dia"])
+    hoy = date.today()
+    for c in configs:
+        c["es_principal"], c["activo"] = bool(c["es_principal"]), bool(c["activo"])
+        c["dias"] = dias.get(c["id_ciclo_config"], [])
+        c["ciclo_actual"] = fetch_one(
+            "SELECT id_ciclo, fecha_inicio, fecha_fin FROM ciclo "
+            "WHERE id_ciclo_config = ? AND fecha_inicio <= ? AND fecha_fin >= ?",
+            (c["id_ciclo_config"], hoy, hoy),
+        )
+    return configs
+
+
+@app.get("/ciclos-config")
+def listar_config_ciclos():
+    _asegurar_ciclos()
+    return _config_ciclos_detalle()
+
+
+@app.post("/ciclos-config")
+def crear_config_ciclos(datos: CicloConfig):
+    with transaccion() as cursor:
+        nombre, dias = _validar_config_ciclo(cursor, datos)
+        cursor.execute("SELECT COUNT(*) FROM ciclo_config WHERE es_principal = 1")
+        sin_principal = cursor.fetchone()[0] == 0
+        principal = datos.activo and (datos.es_principal or sin_principal)
+        if datos.es_principal and not datos.activo:
+            raise _rechazar(422, "La configuración principal debe estar activa.")
+        if principal:
+            cursor.execute("UPDATE ciclo_config SET es_principal = 0 WHERE es_principal = 1")
+        cursor.execute(
+            "INSERT INTO ciclo_config (nombre, ajuste_fin_semana, es_principal, activo) OUTPUT INSERTED.id_ciclo_config "
+            "VALUES (?, ?, ?, ?)",
+            (nombre, datos.ajuste_fin_semana, 1 if principal else 0, 1 if datos.activo else 0),
+        )
+        id_config = cursor.fetchone()[0]
+        _guardar_dias(cursor, id_config, dias)
+        _generar_ciclos(cursor, id_config)
+    return _config_ciclos_detalle(id_config)[0]
+
+
+@app.put("/ciclos-config/{id_config}")
+def actualizar_config_ciclos(id_config: int, datos: CicloConfig):
+    with transaccion() as cursor:
+        anterior = _cargar_config(cursor, id_config)
+        nombre, dias = _validar_config_ciclo(cursor, datos, id_config)
+        if anterior["es_principal"] and not datos.activo:
+            raise _rechazar(409, "La configuración principal no se puede desactivar: marca otra como principal primero.")
+        if datos.es_principal and not datos.activo:
+            raise _rechazar(422, "La configuración principal debe estar activa.")
+        principal = anterior["es_principal"] or datos.es_principal
+        if principal and not anterior["es_principal"]:
+            cursor.execute("UPDATE ciclo_config SET es_principal = 0 WHERE es_principal = 1")
+        cursor.execute(
+            "UPDATE ciclo_config SET nombre = ?, ajuste_fin_semana = ?, es_principal = ?, activo = ? "
+            "WHERE id_ciclo_config = ?",
+            (nombre, datos.ajuste_fin_semana, 1 if principal else 0, 1 if datos.activo else 0, id_config),
+        )
+        if dias != anterior["dias"] or datos.ajuste_fin_semana != anterior["ajuste_fin_semana"]:
+            _guardar_dias(cursor, id_config, dias)
+            # El historial se conserva; el ciclo actual y los futuros se vuelven a calcular con la regla nueva.
+            cursor.execute("DELETE FROM ciclo WHERE id_ciclo_config = ? AND fecha_fin >= ?", (id_config, date.today()))
+        _generar_ciclos(cursor, id_config)
+    return _config_ciclos_detalle(id_config)[0]
+
+
+@app.delete("/ciclos-config/{id_config}")
+def eliminar_config_ciclos(id_config: int):
+    with transaccion() as cursor:
+        config = _cargar_config(cursor, id_config)
+        cursor.execute("SELECT COUNT(*) FROM ciclo_config WHERE id_ciclo_config <> ?", (id_config,))
+        if config["es_principal"] and cursor.fetchone()[0]:
+            raise _rechazar(409, "No se puede eliminar la configuración principal: marca otra como principal primero.")
+        cursor.execute("DELETE FROM ciclo_config WHERE id_ciclo_config = ?", (id_config,))
+    return {"eliminado": True}
+
+
+def _ciclos_detalle(filtro, parametros, tope=""):
+    hoy = date.today()
+    ciclos = fetch_all(
+        "SELECT " + tope + " c.id_ciclo, c.id_ciclo_config, cfg.nombre AS config, c.fecha_inicio, c.fecha_fin, "
+        "c.ajustado, (SELECT p.id_ciclo FROM ciclo p WHERE p.id_ciclo_config = c.id_ciclo_config "
+        "AND p.fecha_fin = DATEADD(day, -1, c.fecha_inicio)) AS id_anterior, "
+        "(SELECT n.id_ciclo FROM ciclo n WHERE n.id_ciclo_config = c.id_ciclo_config "
+        "AND n.fecha_inicio = DATEADD(day, 1, c.fecha_fin)) AS id_siguiente "
+        "FROM ciclo c JOIN ciclo_config cfg ON cfg.id_ciclo_config = c.id_ciclo_config " + filtro +
+        "ORDER BY c.fecha_inicio DESC",
+        parametros,
+    )
+    for c in ciclos:
+        c["ajustado"] = bool(c["ajustado"])
+        c["es_actual"] = c["fecha_inicio"] <= hoy <= c["fecha_fin"]
+        c["dias"] = (c["fecha_fin"] - c["fecha_inicio"]).days + 1
+    return ciclos
+
+
+def _config_principal():
+    fila = fetch_one("SELECT id_ciclo_config FROM ciclo_config WHERE es_principal = 1 AND activo = 1")
+    return fila["id_ciclo_config"] if fila else None
+
+
+@app.get("/ciclos")
+def listar_ciclos(id_ciclo_config: Optional[int] = None, limite: int = 36):
+    """Ciclos de una configuracion (la principal por defecto), del mas reciente al mas antiguo."""
+    _asegurar_ciclos()
+    id_config = id_ciclo_config if id_ciclo_config is not None else _config_principal()
+    if id_config is None:
+        return {"config": None, "ciclos": []}
+    config = _config_ciclos_detalle(id_config)
+    if not config:
+        raise _rechazar(404, "La configuración de ciclos no existe.")
+    limite = min(max(limite, 1), 200)
+    return {
+        "config": config[0],
+        "ciclos": _ciclos_detalle("WHERE c.id_ciclo_config = ? ", (id_config,), "TOP %d" % limite),
+    }
+
+
+@app.get("/ciclos/actual")
+def obtener_ciclo_actual(id_ciclo_config: Optional[int] = None):
+    _asegurar_ciclos()
+    id_config = id_ciclo_config if id_ciclo_config is not None else _config_principal()
+    if id_config is None:
+        return None
+    hoy = date.today()
+    ciclos = _ciclos_detalle(
+        "WHERE c.id_ciclo_config = ? AND c.fecha_inicio <= ? AND c.fecha_fin >= ? ", (id_config, hoy, hoy)
+    )
+    return ciclos[0] if ciclos else None
+
+
+@app.put("/ciclos/{id_ciclo}")
+def ajustar_ciclo(id_ciclo: int, datos: CicloAjuste):
+    """Mueve la fecha de inicio de un ciclo (por ejemplo, porque la paga llego antes). El ciclo anterior termina
+    el dia previo, asi no quedan huecos ni traslapes."""
+    with transaccion() as cursor:
+        cursor.execute(
+            "SELECT id_ciclo_config, fecha_inicio, fecha_fin FROM ciclo WHERE id_ciclo = ?", (id_ciclo,)
+        )
+        ciclo = cursor.fetchone()
+        if not ciclo:
+            raise _rechazar(404, "El ciclo no existe.")
+        id_config, inicio, fin = ciclo
+        if datos.fecha_inicio > fin:
+            raise _rechazar(422, "El inicio no puede ser posterior al fin del ciclo (%s)." % fin.isoformat())
+        cursor.execute(
+            "SELECT id_ciclo, fecha_inicio FROM ciclo WHERE id_ciclo_config = ? AND fecha_fin = ?",
+            (id_config, inicio - timedelta(days=1)),
+        )
+        previo = cursor.fetchone()
+        if previo and datos.fecha_inicio <= previo[1]:
+            raise _rechazar(
+                422, "El ciclo anterior empieza el %s: el inicio debe ser posterior." % previo[1].isoformat()
+            )
+        if datos.fecha_inicio != inicio:
+            cursor.execute(
+                "UPDATE ciclo SET fecha_inicio = ?, ajustado = 1 WHERE id_ciclo = ?", (datos.fecha_inicio, id_ciclo)
+            )
+            if previo:
+                cursor.execute(
+                    "UPDATE ciclo SET fecha_fin = ?, ajustado = 1 WHERE id_ciclo = ?",
+                    (datos.fecha_inicio - timedelta(days=1), previo[0]),
+                )
+    return _ciclos_detalle("WHERE c.id_ciclo = ? ", (id_ciclo,))[0]
+
+
 # ---------- resumen (pantalla Main) ----------
 
 MAX_SUBCUENTAS = 3
@@ -2541,12 +2864,20 @@ def _saldos_antes_de(fecha):
     }
 
 
-def _resumen_kpis(cuentas, inicio_mes):
-    ahorro = sum((c["saldo"] for c in cuentas if c["tipo"] != TARJETA), Decimal(0))
+def _resumen_kpis(cuentas, inicio_ciclo, cierre=None):
+    """Totales de ahorro, deuda y patrimonio y su variacion desde el inicio del ciclo.
+
+    Con `cierre` (un ciclo ya terminado) los totales son los de ese dia en vez de los de hoy.
+    """
     tarjetas = [c for c in cuentas if c["tipo"] == TARJETA]
-    deuda = sum((c["saldo"] for c in tarjetas), Decimal(0))
+    if cierre is None:
+        ahorro = sum((c["saldo"] for c in cuentas if c["tipo"] != TARJETA), Decimal(0))
+        deuda = sum((c["saldo"] for c in tarjetas), Decimal(0))
+    else:
+        al_cierre = _saldos_antes_de(cierre + timedelta(days=1))
+        ahorro, deuda = al_cierre["ahorro"], al_cierre["tarjetas"]
     limite = sum((c["limite_credito"] or Decimal(0) for c in tarjetas), Decimal(0))
-    previo = _saldos_antes_de(inicio_mes)
+    previo = _saldos_antes_de(inicio_ciclo)
     return {
         "ahorro": {
             "total": _num(ahorro),
@@ -2622,7 +2953,7 @@ def _resumen_cuentas(cuentas):
     return resultado
 
 
-def _resumen_actividad():
+def _resumen_actividad(desde, hasta):
     return fetch_all(
         "SELECT TOP %d t.id_transaccion, t.fecha, t.tipo, t.monto, t.descripcion, "
         "categorias.nombre AS categoria, origen.nombre AS cuenta_origen, "
@@ -2631,18 +2962,23 @@ def _resumen_actividad():
         "LEFT JOIN categorias ON categorias.id_categoria = t.id_categoria "
         "LEFT JOIN cuentas origen ON origen.id_cuenta = t.id_cuenta_origen "
         "LEFT JOIN cuentas destino ON destino.id_cuenta = t.id_cuenta_destino "
-        "ORDER BY t.fecha DESC, t.id_transaccion DESC" % MAX_ACTIVIDAD
+        "WHERE t.fecha >= ? AND t.fecha <= ? "
+        "ORDER BY t.fecha DESC, t.id_transaccion DESC" % MAX_ACTIVIDAD,
+        (desde, hasta),
     )
 
 
-def _resumen_gastos(inicio_mes, inicio_mes_siguiente):
+SALDO_INICIAL = "Saldo inicial"  # descripcion con la que se registra el saldo de apertura de una cuenta
+
+
+def _resumen_gastos(desde, hasta):
     filas = fetch_all(
         "SELECT categorias.id_categoria, categorias.nombre, SUM(t.monto) AS total "
         "FROM transacciones t "
         "LEFT JOIN categorias ON categorias.id_categoria = t.id_categoria "
-        "WHERE t.tipo = 'GASTO' AND t.fecha >= ? AND t.fecha < ? "
+        "WHERE t.tipo = 'GASTO' AND t.fecha >= ? AND t.fecha <= ? AND ISNULL(t.descripcion, '') <> ? "
         "GROUP BY categorias.id_categoria, categorias.nombre ORDER BY total DESC",
-        (inicio_mes, inicio_mes_siguiente),
+        (desde, hasta, SALDO_INICIAL),
     )
     total = sum((f["total"] for f in filas), Decimal(0))
     # "Otros" y los gastos sin categoria siempre van al final, junto con lo que no cabe en el top.
@@ -2661,7 +2997,66 @@ def _resumen_gastos(inicio_mes, inicio_mes_siguiente):
             {"id_categoria": None, "nombre": "Otros", "total": _num(total_resto),
              "porcentaje": _porcentaje(total_resto, total)}
         )
-    return {"mes": inicio_mes.isoformat()[:7], "total": _num(total), "categorias": categorias}
+    return {"desde": desde, "hasta": hasta, "total": _num(total), "categorias": categorias}
+
+
+def _totales_periodo(desde, hasta):
+    """Ingresos y gastos entre dos fechas (inclusive). Los saldos iniciales, las transferencias y los pagos a
+    tarjeta no cuentan: no son dinero que entra ni que se gasta."""
+    fila = fetch_one(
+        "SELECT ISNULL(SUM(CASE WHEN tipo = 'INGRESO' THEN monto END), 0) AS ingresos, "
+        "ISNULL(SUM(CASE WHEN tipo = 'GASTO' THEN monto END), 0) AS gastos "
+        "FROM transacciones WHERE fecha >= ? AND fecha <= ? AND ISNULL(descripcion, '') <> ?",
+        (desde, hasta, SALDO_INICIAL),
+    )
+    return fila["ingresos"], fila["gastos"]
+
+
+def _resumen_periodo(ciclo, hoy):
+    """Ingresos y gastos del ciclo, y su variacion en porcentaje frente a los totales del ciclo anterior completo."""
+    ingresos, gastos = _totales_periodo(ciclo["fecha_inicio"], ciclo["fecha_fin"])
+    resultado = {
+        "ingresos": {"total": _num(ingresos), "variacion_pct": None, "anterior_total": None},
+        "gastos": {"total": _num(gastos), "variacion_pct": None, "anterior_total": None},
+        "balance": _num(ingresos - gastos),
+        "comparacion": None,
+    }
+    previo = ciclo["anterior"]
+    if previo:
+        ing_previo, gas_previo = _totales_periodo(previo["fecha_inicio"], previo["fecha_fin"])
+        resultado["ingresos"].update(variacion_pct=_variacion_pct(ingresos, ing_previo), anterior_total=_num(ing_previo))
+        resultado["gastos"].update(variacion_pct=_variacion_pct(gastos, gas_previo), anterior_total=_num(gas_previo))
+        resultado["comparacion"] = {"desde": previo["fecha_inicio"], "hasta": previo["fecha_fin"]}
+    return resultado
+
+
+def _ciclo_del_resumen(id_ciclo, hoy):
+    """El ciclo que muestra el Resumen: el pedido o, si no, el actual de la configuracion principal.
+    Sin configuracion de ciclos, se usa el mes calendario."""
+    ciclo = None
+    if id_ciclo is not None:
+        _asegurar_ciclos()
+        encontrados = _ciclos_detalle("WHERE c.id_ciclo = ? ", (id_ciclo,))
+        if not encontrados:
+            raise _rechazar(404, "El ciclo no existe.")
+        ciclo = encontrados[0]
+    else:
+        ciclo = obtener_ciclo_actual()
+    if ciclo is None:
+        inicio = hoy.replace(day=1)
+        fin = (inicio + timedelta(days=32)).replace(day=1) - timedelta(days=1)
+        anterior_fin = inicio - timedelta(days=1)
+        return {
+            "id_ciclo": None, "id_ciclo_config": None, "config": "Mes calendario", "fecha_inicio": inicio,
+            "fecha_fin": fin, "ajustado": False, "es_actual": True, "id_anterior": None, "id_siguiente": None,
+            "dias": (fin - inicio).days + 1,
+            "anterior": {"fecha_inicio": anterior_fin.replace(day=1), "fecha_fin": anterior_fin},
+        }
+    ciclo["anterior"] = None
+    if ciclo["id_anterior"]:
+        previo = _ciclos_detalle("WHERE c.id_ciclo = ? ", (ciclo["id_anterior"],))[0]
+        ciclo["anterior"] = {"fecha_inicio": previo["fecha_inicio"], "fecha_fin": previo["fecha_fin"]}
+    return ciclo
 
 
 def _resumen_obligaciones():
@@ -2711,28 +3106,32 @@ def _resumen_obligaciones():
 
 
 @app.get("/resumen")
-def obtener_resumen():
+def obtener_resumen(id_ciclo: Optional[int] = None):
     """Todo lo que necesita la pantalla Main, ya calculado.
 
-    - kpis.*.variacion_pct: cambio frente al cierre del mes anterior (null si no hay base).
+    - ciclo: el ciclo mostrado (`id_ciclo`, o el actual de la configuracion principal) con los ids de los vecinos.
+    - periodo: ingresos y gastos del ciclo y su variacion frente al ciclo anterior.
+    - kpis.*.variacion_pct: cambio desde el inicio del ciclo (null si no hay base). En un ciclo ya terminado los
+      totales son los del dia de su cierre.
     - Tarjetas: saldo/deuda segun vw_saldo_cuentas (salidas - entradas); negativo = saldo a favor.
-    - gastos_por_categoria: solo transacciones tipo GASTO del mes en curso.
+    - gastos_por_categoria y actividad_reciente: solo lo ocurrido dentro del ciclo.
     - obligaciones: solo POR_COBRAR / POR_PAGAR pendientes; monto > 0 te deben, < 0 les debes.
     """
     hoy = date.today()
-    inicio_mes = hoy.replace(day=1)
-    inicio_mes_siguiente = (inicio_mes + timedelta(days=32)).replace(day=1)
-
+    ciclo = _ciclo_del_resumen(id_ciclo, hoy)
     cuentas = fetch_all(
         "SELECT c.id_cuenta, c.nombre, c.entidad, c.tipo, c.limite_credito, s.saldo_calculado AS saldo "
         "FROM cuentas c JOIN vw_saldo_cuentas s ON s.id_cuenta = c.id_cuenta "
         "ORDER BY CASE WHEN c.tipo = 'TARJETA_CREDITO' THEN 1 ELSE 0 END, c.id_cuenta"
     )
+    terminado = ciclo["fecha_fin"] < hoy
     return {
         "fecha": hoy,
-        "kpis": _resumen_kpis(cuentas, inicio_mes),
+        "ciclo": {k: v for k, v in ciclo.items() if k != "anterior"},
+        "periodo": _resumen_periodo(ciclo, hoy),
+        "kpis": _resumen_kpis(cuentas, ciclo["fecha_inicio"], ciclo["fecha_fin"] if terminado else None),
         "cuentas": _resumen_cuentas(cuentas),
-        "actividad_reciente": _resumen_actividad(),
-        "gastos_por_categoria": _resumen_gastos(inicio_mes, inicio_mes_siguiente),
+        "actividad_reciente": _resumen_actividad(ciclo["fecha_inicio"], ciclo["fecha_fin"]),
+        "gastos_por_categoria": _resumen_gastos(ciclo["fecha_inicio"], ciclo["fecha_fin"]),
         "obligaciones": _resumen_obligaciones(),
     }

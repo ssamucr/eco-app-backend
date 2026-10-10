@@ -203,3 +203,15 @@ class LoteLiquidacion(BaseModel):
     id_cuenta_pago: int
     id_subcuenta_pago: Optional[int] = None
     descripcion: Optional[str] = None
+
+
+class CicloConfig(BaseModel):
+    nombre: str
+    dias: List[int]
+    ajuste_fin_semana: str = "ANTERIOR"
+    es_principal: bool = False
+    activo: bool = True
+
+
+class CicloAjuste(BaseModel):
+    fecha_inicio: date
