@@ -1,13 +1,15 @@
 import calendar
+import os
 import re
 from contextlib import contextmanager
 from datetime import date, timedelta
 from decimal import ROUND_DOWN, Decimal
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
+from auth import exigir_usuario
 from db import get_connection
 from schemas import (
     CalendarioFinanciamiento,
@@ -35,14 +37,24 @@ from schemas import (
     TransaccionNueva,
 )
 
-app = FastAPI()
+# Toda ruta exige un usuario autenticado (ver auth.py), salvo /health.
+app = FastAPI(dependencies=[Depends(exigir_usuario)])
 
+# Origenes del front permitidos: ECO_CORS_ORIGENES separados por coma (por defecto, el servidor de desarrollo).
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173"],
+    allow_origins=[o.strip() for o in os.environ.get("ECO_CORS_ORIGENES", "http://localhost:5173").split(",") if o.strip()],
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["Content-Disposition"],
 )
+
+
+@app.get("/health")
+def estado_api():
+    """Para vigilar que la API y la base respondan (no devuelve datos)."""
+    fetch_one("SELECT 1 AS ok")
+    return {"ok": True}
 
 
 # ---------- helpers de acceso a datos ----------
