@@ -12,19 +12,24 @@ Hecha con **FastAPI** + **SQL Server** (`pyodbc`). El frontend vive en
 
 - Python 3.8 o superior
 - SQL Server (por ejemplo, SQL Server Express) y el driver **ODBC Driver 17 for SQL Server**
-- Una base de datos llamada `eco` con las tablas y vistas de la app (`vw_saldo_cuentas`, `vw_estado_obligaciones`, ...).
-  El script del esquema no está en este repositorio.
+- Permisos de administrador en SQL Server para crear la base de datos (por ejemplo, tu usuario de Windows)
 
 ## Puesta en marcha
 
-1. Crea el usuario de la aplicación en SQL Server:
+1. Crea la base de datos y el usuario de la aplicación. El script `database/eco.sql` crea la base `eco` completa
+   (tablas, restricciones y vistas, sin datos) y se puede volver a ejecutar sin riesgo: nunca borra nada.
 
-   ```sql
-   CREATE LOGIN eco_app WITH PASSWORD = 'tu_clave';
-   USE eco;
-   CREATE USER eco_app FOR LOGIN eco_app;
-   ALTER ROLE db_owner ADD MEMBER eco_app;
+   ```bash
+   sqlcmd -S localhost\SQLEXPRESS -E -i database\eco.sql
    ```
+
+   Luego abre `database/usuario.sql`, cambia `<TU_CLAVE>` por una contraseña propia y ejecútalo:
+
+   ```bash
+   sqlcmd -S localhost\SQLEXPRESS -E -i database\usuario.sql
+   ```
+
+   Si ya tenías la base creada antes de los ciclos, basta con ejecutar `migraciones/001_ciclos.sql`.
 
 2. Instala las dependencias:
 
@@ -35,8 +40,8 @@ Hecha con **FastAPI** + **SQL Server** (`pyodbc`). El frontend vive en
    ```
 
 3. Configura la conexión: copia `.env.example` como `.env` y completa tus datos
-   (`ECO_DB_USUARIO`, `ECO_DB_CONTRASENA`, y `ECO_DB_SERVIDOR` si no es `localhost\SQLEXPRESS`).
-   El `.env` no se sube a git.
+   (`ECO_DB_USUARIO`, `ECO_DB_CONTRASENA` —la misma clave del paso 1— y `ECO_DB_SERVIDOR` si no es
+   `localhost\SQLEXPRESS`). El `.env` no se sube a git.
 
 4. Arranca el servidor:
 
@@ -48,3 +53,9 @@ Hecha con **FastAPI** + **SQL Server** (`pyodbc`). El frontend vive en
 
 > CORS solo permite peticiones desde `http://localhost:5173` (el frontend en desarrollo).
 > Para otro origen, cambia `allow_origins` en `main.py`.
+
+## Base de datos
+
+- `database/eco.sql`: esquema completo (estructura, sin datos). Es la referencia para crear la base desde cero.
+- `database/usuario.sql`: crea el usuario de la aplicación (hay que poner tu propia contraseña).
+- `migraciones/`: cambios incrementales para bases que ya existen.
