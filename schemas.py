@@ -186,6 +186,20 @@ class LiquidacionObligacion(BaseModel):
     id_obligacion: int
     fecha: date
     monto: float
+    # Para vincular movimientos que ya registraste...
     id_transaccion: Optional[int] = None
     id_movimiento_subcuenta: Optional[int] = None
+    # ...o para que se generen: la cuenta (y subcuenta) de donde sale el dinero (en una obligacion por
+    # cobrar, la que lo recibe).
+    id_cuenta_pago: Optional[int] = None
+    id_subcuenta_pago: Optional[int] = None
+    descripcion: Optional[str] = None
+
+
+class LoteLiquidacion(BaseModel):
+    """Liquida por completo varias obligaciones a la vez, con un mismo origen y una misma fecha."""
+    fecha: date
+    ids_obligacion: List[int]
+    id_cuenta_pago: int
+    id_subcuenta_pago: Optional[int] = None
     descripcion: Optional[str] = None
