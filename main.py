@@ -1548,11 +1548,16 @@ def _pagina(limite, pagina):
 
 @app.get("/movimientos-detalle")
 def listar_movimientos_detalle(
-    limite: int = 50, pagina: int = 0, desde: Optional[date] = None, hasta: Optional[date] = None
+    limite: int = 50, pagina: int = 0, desde: Optional[date] = None, hasta: Optional[date] = None,
+    id_categoria: Optional[int] = None,
 ):
-    """Transacciones de la mas reciente a la mas antigua, con nombres ya resueltos (opcionalmente entre dos fechas)."""
+    """Transacciones de la mas reciente a la mas antigua, con nombres ya resueltos (opcionalmente entre dos fechas
+    y de una categoria)."""
     limite, desplazamiento = _pagina(limite, pagina)
     filtro, parametros = _filtro_fechas("t.fecha", desde, hasta)
+    if id_categoria is not None:
+        filtro = (filtro + "AND " if filtro else "WHERE ") + "t.id_categoria = ? "
+        parametros += (id_categoria,)
     movimientos = fetch_all(
         "SELECT t.id_transaccion, t.fecha, t.tipo, t.monto, t.descripcion, t.referencia, "
         "categorias.nombre AS categoria, origen.nombre AS cuenta_origen, destino.nombre AS cuenta_destino, "
@@ -3135,3 +3140,8 @@ def obtener_resumen(id_ciclo: Optional[int] = None):
         "gastos_por_categoria": _resumen_gastos(ciclo["fecha_inicio"], ciclo["fecha_fin"]),
         "obligaciones": _resumen_obligaciones(),
     }
+
+
+# La vista de analitica registra sus rutas al importarse (necesita los helpers definidos arriba).
+import analitica  # noqa: E402,F401
+import exportacion  # noqa: E402,F401
