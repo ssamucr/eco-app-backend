@@ -141,7 +141,7 @@ def _sin_asignar(cursor, id_cuenta):
     fila = cursor.fetchone()
     if not fila:
         raise _rechazar(404, "La cuenta no existe.")
-    cursor.execute("SELECT ISNULL(SUM(saldo), 0) FROM subcuentas WHERE id_cuenta = ?", (id_cuenta,))
+    cursor.execute("SELECT COALESCE(SUM(saldo), 0) FROM subcuentas WHERE id_cuenta = ?", (id_cuenta,))
     return fila[0] - cursor.fetchone()[0]
 
 
@@ -164,7 +164,7 @@ def _movimiento_subcuenta(cursor, monto, origen, destino, descripcion, id_transa
 def _insertar_subcuenta(cursor, id_cuenta, nombre, monto, saldo_meta, descripcion, id_transaccion=None):
     cursor.execute(
         "INSERT INTO subcuentas (nombre, saldo, saldo_meta, descripcion, id_cuenta) "
-        "OUTPUT INSERTED.* VALUES (?, ?, ?, ?, ?)",
+        "VALUES (?, ?, ?, ?, ?) RETURNING *",
         (nombre, monto, _dinero(saldo_meta) if saldo_meta is not None else None, descripcion, id_cuenta),
     )
     subcuenta = fila_actual(cursor)
@@ -230,7 +230,7 @@ def obtener_persona(id_persona: int):
 def crear_persona(persona: Persona):
     nombre = _nombre_requerido(persona.nombre, LIMITE_NOMBRE_PERSONA, "El nombre")
     _exigir_nombre_libre("personas", "id_persona", nombre, None, "Ya existe una persona con ese nombre.")
-    return run_returning("INSERT INTO personas (nombre) OUTPUT INSERTED.* VALUES (?)", (nombre,))
+    return run_returning("INSERT INTO personas (nombre) VALUES (?) RETURNING *", (nombre,))
 
 
 @app.put("/personas/{id_persona}")
@@ -238,7 +238,7 @@ def actualizar_persona(id_persona: int, persona: Persona):
     nombre = _nombre_requerido(persona.nombre, LIMITE_NOMBRE_PERSONA, "El nombre")
     _exigir_nombre_libre("personas", "id_persona", nombre, id_persona, "Ya existe una persona con ese nombre.")
     actualizada = run_returning(
-        "UPDATE personas SET nombre = ? OUTPUT INSERTED.* WHERE id_persona = ?",
+        "UPDATE personas SET nombre = ? WHERE id_persona = ? RETURNING *",
         (nombre, id_persona),
     )
     if not actualizada:
@@ -277,8 +277,8 @@ def _personas_detalle(id_persona=None):
     parametros = (id_persona,) if id_persona is not None else ()
     personas = fetch_all(
         "SELECT p.id_persona, p.nombre, "
-        "ISNULL(SUM(CASE WHEN e.resuelta = 0 AND o.tipo = 'POR_COBRAR' THEN e.monto_pendiente END), 0) AS por_cobrar, "
-        "ISNULL(SUM(CASE WHEN e.resuelta = 0 AND o.tipo = 'POR_PAGAR' THEN e.monto_pendiente END), 0) AS por_pagar, "
+        "COALESCE(SUM(CASE WHEN e.resuelta = 0 AND o.tipo = 'POR_COBRAR' THEN e.monto_pendiente END), 0) AS por_cobrar, "
+        "COALESCE(SUM(CASE WHEN e.resuelta = 0 AND o.tipo = 'POR_PAGAR' THEN e.monto_pendiente END), 0) AS por_pagar, "
         "SUM(CASE WHEN e.resuelta = 0 THEN 1 ELSE 0 END) AS pendientes, "
         "SUM(CASE WHEN e.resuelta = 1 THEN 1 ELSE 0 END) AS liquidadas "
         "FROM personas p "
@@ -366,7 +366,7 @@ def crear_categoria(categoria: Categoria):
     nombre, descripcion = _validar_categoria(categoria)
     _exigir_nombre_libre("categorias", "id_categoria", nombre, None, "Ya existe una categoría con ese nombre.")
     return run_returning(
-        "INSERT INTO categorias (nombre, descripcion) OUTPUT INSERTED.* VALUES (?, ?)",
+        "INSERT INTO categorias (nombre, descripcion) VALUES (?, ?) RETURNING *",
         (nombre, descripcion),
     )
 
@@ -376,7 +376,7 @@ def actualizar_categoria(id_categoria: int, categoria: Categoria):
     nombre, descripcion = _validar_categoria(categoria)
     _exigir_nombre_libre("categorias", "id_categoria", nombre, id_categoria, "Ya existe una categoría con ese nombre.")
     actualizada = run_returning(
-        "UPDATE categorias SET nombre = ?, descripcion = ? OUTPUT INSERTED.* WHERE id_categoria = ?",
+        "UPDATE categorias SET nombre = ?, descripcion = ? WHERE id_categoria = ? RETURNING *",
         (nombre, descripcion, id_categoria),
     )
     if not actualizada:
@@ -469,7 +469,7 @@ def crear_cuenta(cuenta: CuentaNueva):
     with transaccion() as cursor:
         cursor.execute(
             "INSERT INTO cuentas (nombre, entidad, tipo, limite_credito) "
-            "OUTPUT INSERTED.* VALUES (?, ?, ?, ?)",
+            "VALUES (?, ?, ?, ?) RETURNING *",
             (nombre, entidad, cuenta.tipo, limite),
         )
         creada = fila_actual(cursor)
@@ -479,7 +479,7 @@ def crear_cuenta(cuenta: CuentaNueva):
         if inicial:
             cursor.execute(
                 "INSERT INTO transacciones (fecha, tipo, monto, id_cuenta_origen, id_cuenta_destino, descripcion) "
-                "OUTPUT INSERTED.id_transaccion VALUES (?, ?, ?, ?, ?, 'Saldo inicial')",
+                "VALUES (?, ?, ?, ?, ?, 'Saldo inicial') RETURNING id_transaccion",
                 (date.today(), inicial[0], inicial[3], inicial[1], inicial[2]),
             )
             id_transaccion = cursor.fetchone()[0]
@@ -500,7 +500,7 @@ def actualizar_cuenta(id_cuenta: int, cuenta: Cuenta):
             raise _rechazar(409, "Elimina primero las subcuentas para convertir la cuenta en tarjeta de crédito.")
     actualizada = run_returning(
         "UPDATE cuentas SET nombre = ?, entidad = ?, tipo = ?, limite_credito = ? "
-        "OUTPUT INSERTED.* WHERE id_cuenta = ?",
+        "WHERE id_cuenta = ? RETURNING *",
         (nombre, entidad, cuenta.tipo, limite, id_cuenta),
     )
     if not actualizada:
@@ -627,12 +627,12 @@ def _cuentas_detalle(id_cuenta=None):
     )
     subcuentas_por_cuenta = {}
     for s in fetch_all(
-        "SELECT s.id_subcuenta, s.id_cuenta, s.nombre, ISNULL(s.saldo, 0) AS saldo, s.saldo_meta, "
+        "SELECT s.id_subcuenta, s.id_cuenta, s.nombre, COALESCE(s.saldo, 0) AS saldo, s.saldo_meta, "
         "ROW_NUMBER() OVER (PARTITION BY s.id_cuenta ORDER BY s.id_subcuenta) - 1 AS indice_color, "
         "s.descripcion, (SELECT COUNT(*) FROM movimientos_subcuenta m "
         "WHERE m.id_subcuenta_origen = s.id_subcuenta OR m.id_subcuenta_destino = s.id_subcuenta) AS movimientos "
         "FROM subcuentas s WHERE s.id_cuenta IS NOT NULL " + solo_sub +
-        "ORDER BY ISNULL(s.saldo, 0) DESC, s.id_subcuenta",
+        "ORDER BY COALESCE(s.saldo, 0) DESC, s.id_subcuenta",
         parametros,
     ):
         subcuentas_por_cuenta.setdefault(s["id_cuenta"], []).append(s)
@@ -742,7 +742,7 @@ def crear_subcuenta(subcuenta: Subcuenta):
 def actualizar_subcuenta(id_subcuenta: int, subcuenta: Subcuenta):
     nombre, descripcion = _validar_subcuenta(subcuenta)
     with transaccion() as cursor:
-        cursor.execute("SELECT id_cuenta, ISNULL(saldo, 0) FROM subcuentas WHERE id_subcuenta = ?", (id_subcuenta,))
+        cursor.execute("SELECT id_cuenta, COALESCE(saldo, 0) FROM subcuentas WHERE id_subcuenta = ?", (id_subcuenta,))
         actual = cursor.fetchone()
         if not actual:
             raise _rechazar(404, "La subcuenta no existe.")
@@ -757,7 +757,7 @@ def actualizar_subcuenta(id_subcuenta: int, subcuenta: Subcuenta):
 
         cursor.execute(
             "UPDATE subcuentas SET nombre = ?, saldo = ?, saldo_meta = ?, descripcion = ? "
-            "OUTPUT INSERTED.* WHERE id_subcuenta = ?",
+            "WHERE id_subcuenta = ? RETURNING *",
             (nombre, nuevo, _dinero(subcuenta.saldo_meta) if subcuenta.saldo_meta is not None else None,
              descripcion, id_subcuenta),
         )
@@ -865,7 +865,7 @@ def _sincronizar_destinos(cursor, id_plan, destinos):
         if destino.id_plan_recurrente_destino is not None:
             cursor.execute(
                 "UPDATE plan_recurrente_destinos SET activo = ? WHERE id_plan_recurrente_destino = ?",
-                (1 if destino.activo else 0, destino.id_plan_recurrente_destino),
+                (bool(destino.activo), destino.id_plan_recurrente_destino),
             )
         else:
             monto, porcentaje = _validar_destino(cursor, destino)
@@ -874,10 +874,10 @@ def _sincronizar_destinos(cursor, id_plan, destinos):
                 "(id_plan, id_cuenta_destino, id_subcuenta_destino, monto, porcentaje, activo) "
                 "VALUES (?, ?, ?, ?, ?, ?)",
                 (id_plan, destino.id_cuenta_destino, destino.id_subcuenta_destino, monto, porcentaje,
-                 1 if destino.activo else 0),
+                 bool(destino.activo)),
             )
     cursor.execute(
-        "SELECT ISNULL(SUM(porcentaje), 0) FROM plan_recurrente_destinos WHERE id_plan = ? AND activo = 1",
+        "SELECT COALESCE(SUM(porcentaje), 0) FROM plan_recurrente_destinos WHERE id_plan = ? AND activo = TRUE",
         (id_plan,),
     )
     if cursor.fetchone()[0] > 100:
@@ -890,8 +890,8 @@ def crear_plan(datos: PlanConDestinos):
     _exigir_nombre_libre("plan_recurrente", "id_plan", nombre, None, "Ya existe un plan con ese nombre.")
     with transaccion() as cursor:
         cursor.execute(
-            "INSERT INTO plan_recurrente (nombre, descripcion, activo) OUTPUT INSERTED.* VALUES (?, ?, ?)",
-            (nombre, descripcion, 1 if datos.activo else 0),
+            "INSERT INTO plan_recurrente (nombre, descripcion, activo) VALUES (?, ?, ?) RETURNING *",
+            (nombre, descripcion, bool(datos.activo)),
         )
         creado = fila_actual(cursor)
         _sincronizar_destinos(cursor, creado["id_plan"], datos.destinos)
@@ -904,8 +904,8 @@ def actualizar_plan(id_plan: int, datos: PlanConDestinos):
     _exigir_nombre_libre("plan_recurrente", "id_plan", nombre, id_plan, "Ya existe un plan con ese nombre.")
     with transaccion() as cursor:
         cursor.execute(
-            "UPDATE plan_recurrente SET nombre = ?, descripcion = ?, activo = ? OUTPUT INSERTED.* WHERE id_plan = ?",
-            (nombre, descripcion, 1 if datos.activo else 0, id_plan),
+            "UPDATE plan_recurrente SET nombre = ?, descripcion = ?, activo = ? WHERE id_plan = ? RETURNING *",
+            (nombre, descripcion, bool(datos.activo), id_plan),
         )
         actualizado = fila_actual(cursor)
         if not actualizado:
@@ -1020,7 +1020,7 @@ def _ejecutar_plan(cursor, id_plan, datos):
         "SELECT d.id_plan_recurrente_destino, d.id_cuenta_destino, c.nombre, c.tipo, d.id_subcuenta_destino, s.nombre, "
         "d.monto, d.porcentaje FROM plan_recurrente_destinos d JOIN cuentas c ON c.id_cuenta = d.id_cuenta_destino "
         "LEFT JOIN subcuentas s ON s.id_subcuenta = d.id_subcuenta_destino "
-        "WHERE d.id_plan = ? AND d.activo = 1 ORDER BY d.id_plan_recurrente_destino",
+        "WHERE d.id_plan = ? AND d.activo = TRUE ORDER BY d.id_plan_recurrente_destino",
         (id_plan,),
     )
     # Las asignaciones dentro de la propia cuenta de origen van al final, cuando ya salio el dinero de las demas.
@@ -1052,7 +1052,7 @@ def _ejecutar_plan(cursor, id_plan, datos):
             movimiento = "Pago a tarjeta" if tipo_cuenta == TARJETA else "Transferencia"
             cursor.execute(
                 "INSERT INTO transacciones (fecha, tipo, monto, id_cuenta_origen, id_cuenta_destino, descripcion) "
-                "OUTPUT INSERTED.id_transaccion VALUES (?, ?, ?, ?, ?, ?)",
+                "VALUES (?, ?, ?, ?, ?, ?) RETURNING id_transaccion",
                 (datos.fecha, tipo_trx, monto, datos.id_cuenta_origen, id_cuenta, descripcion),
             )
             id_transaccion = cursor.fetchone()[0]
@@ -1099,7 +1099,7 @@ def crear_destino(destino: PlanRecurrenteDestino):
     return run_returning(
         "INSERT INTO plan_recurrente_destinos "
         "(id_plan, id_cuenta_destino, id_subcuenta_destino, monto, porcentaje, activo) "
-        "OUTPUT INSERTED.* VALUES (?, ?, ?, ?, ?, ?)",
+        "VALUES (?, ?, ?, ?, ?, ?) RETURNING *",
         (destino.id_plan, destino.id_cuenta_destino, destino.id_subcuenta_destino,
          destino.monto, destino.porcentaje, destino.activo),
     )
@@ -1110,7 +1110,7 @@ def actualizar_destino(id_destino: int, destino: PlanRecurrenteDestino):
     return run_returning(
         "UPDATE plan_recurrente_destinos SET id_plan = ?, id_cuenta_destino = ?, "
         "id_subcuenta_destino = ?, monto = ?, porcentaje = ?, activo = ? "
-        "OUTPUT INSERTED.* WHERE id_plan_recurrente_destino = ?",
+        "WHERE id_plan_recurrente_destino = ? RETURNING *",
         (destino.id_plan, destino.id_cuenta_destino, destino.id_subcuenta_destino,
          destino.monto, destino.porcentaje, destino.activo, id_destino),
     )
@@ -1259,12 +1259,12 @@ def _validar_movimiento_subcuenta(cursor, tipo, monto, origen, destino, categori
 
 
 def _subcuenta_saldo(cursor, id_subcuenta):
-    cursor.execute("SELECT nombre, ISNULL(saldo, 0), id_cuenta FROM subcuentas WHERE id_subcuenta = ?", (id_subcuenta,))
+    cursor.execute("SELECT nombre, COALESCE(saldo, 0), id_cuenta FROM subcuentas WHERE id_subcuenta = ?", (id_subcuenta,))
     return cursor.fetchone()
 
 
 def _mover_saldo(cursor, id_subcuenta, delta):
-    cursor.execute("UPDATE subcuentas SET saldo = ISNULL(saldo, 0) + ? WHERE id_subcuenta = ?", (delta, id_subcuenta))
+    cursor.execute("UPDATE subcuentas SET saldo = COALESCE(saldo, 0) + ? WHERE id_subcuenta = ?", (delta, id_subcuenta))
 
 
 def _aplicar_movimiento_subcuenta(cursor, monto, origen, destino):
@@ -1298,7 +1298,7 @@ def _crear_movimiento_subcuenta(cursor, fecha, tipo, monto, origen, destino, cat
     cursor.execute(
         "INSERT INTO movimientos_subcuenta "
         "(fecha, tipo, monto, id_subcuenta_origen, id_subcuenta_destino, id_categoria, descripcion, "
-        "id_transaccion_relacionada) OUTPUT INSERTED.* VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        "id_transaccion_relacionada) VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING *",
         (fecha, tipo, monto, origen, destino, categoria, descripcion, id_transaccion),
     )
     return fila_actual(cursor)
@@ -1324,7 +1324,7 @@ REFERENCIAS_MOVIMIENTO_SUBCUENTA = [
 
 @app.get("/transacciones")
 def listar_transacciones():
-    return fetch_all("SELECT * FROM transacciones ORDER BY fecha DESC")
+    return fetch_all("SELECT * FROM transacciones ORDER BY fecha DESC, id_transaccion")
 
 
 @app.get("/transacciones/{id_transaccion}")
@@ -1356,7 +1356,7 @@ def crear_transaccion(datos: TransaccionNueva):
         cursor.execute(
             "INSERT INTO transacciones "
             "(fecha, tipo, monto, id_cuenta_origen, id_cuenta_destino, id_categoria, descripcion, referencia) "
-            "OUTPUT INSERTED.* VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING *",
             (fecha, tipo, monto, origen, destino, categoria, descripcion, referencia),
         )
         creada = fila_actual(cursor)
@@ -1402,7 +1402,7 @@ def actualizar_transaccion(id_transaccion: int, datos: TransaccionEditar):
         cursor.execute(
             "UPDATE transacciones SET fecha = ?, tipo = ?, monto = ?, id_cuenta_origen = ?, "
             "id_cuenta_destino = ?, id_categoria = ?, descripcion = ?, referencia = ? "
-            "OUTPUT INSERTED.* WHERE id_transaccion = ?",
+            "WHERE id_transaccion = ? RETURNING *",
             (fecha, tipo, monto, origen, destino, categoria, descripcion, referencia, id_transaccion),
         )
         actualizada = fila_actual(cursor)
@@ -1447,7 +1447,7 @@ def eliminar_transaccion(id_transaccion: int):
 
 @app.get("/movimientos-subcuenta")
 def listar_movimientos_subcuenta():
-    return fetch_all("SELECT * FROM movimientos_subcuenta ORDER BY fecha DESC")
+    return fetch_all("SELECT * FROM movimientos_subcuenta ORDER BY fecha DESC, id_movimiento_subcuenta")
 
 
 @app.get("/movimientos-subcuenta/{id_movimiento}")
@@ -1501,7 +1501,7 @@ def actualizar_movimiento_subcuenta(id_movimiento: int, datos: MovimientoSubcuen
         cursor.execute(
             "UPDATE movimientos_subcuenta SET fecha = ?, tipo = ?, monto = ?, id_subcuenta_origen = ?, "
             "id_subcuenta_destino = ?, id_categoria = ?, descripcion = ?, id_transaccion_relacionada = ? "
-            "OUTPUT INSERTED.* WHERE id_movimiento_subcuenta = ?",
+            "WHERE id_movimiento_subcuenta = ? RETURNING *",
             (datos.fecha, datos.tipo, monto, datos.id_subcuenta_origen, datos.id_subcuenta_destino,
              datos.id_categoria, descripcion, datos.id_transaccion_relacionada, id_movimiento),
         )
@@ -1639,7 +1639,7 @@ TIPOS_OBLIGACION = ("POR_COBRAR", "POR_PAGAR", "REPOSICION")
 
 
 def _liquidado(cursor, id_obligacion):
-    cursor.execute("SELECT ISNULL(SUM(monto), 0) FROM liquidaciones_obligacion WHERE id_obligacion = ?", (id_obligacion,))
+    cursor.execute("SELECT COALESCE(SUM(monto), 0) FROM liquidaciones_obligacion WHERE id_obligacion = ?", (id_obligacion,))
     return cursor.fetchone()[0]
 
 
@@ -1686,7 +1686,7 @@ def _validar_obligacion(cursor, datos, liquidado=Decimal(0)):
 
 @app.get("/obligaciones")
 def listar_obligaciones():
-    return fetch_all("SELECT * FROM obligaciones ORDER BY fecha_creacion DESC")
+    return fetch_all("SELECT * FROM obligaciones ORDER BY fecha_creacion DESC, id_obligacion")
 
 
 @app.get("/obligaciones/{id_obligacion}")
@@ -1701,7 +1701,7 @@ def crear_obligacion(datos: Obligacion):
         cursor.execute(
             "INSERT INTO obligaciones (fecha_creacion, tipo, monto, descripcion, id_persona, id_transaccion_origen, "
             "id_movimiento_subcuenta_origen, id_cuenta_destino_resolucion, id_subcuenta_destino_resolucion) "
-            "OUTPUT INSERTED.* VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING *",
             (datos.fecha_creacion, datos.tipo, monto, concepto, datos.id_persona, datos.id_transaccion_origen,
              datos.id_movimiento_subcuenta_origen, datos.id_cuenta_destino_resolucion,
              datos.id_subcuenta_destino_resolucion),
@@ -1719,7 +1719,7 @@ def actualizar_obligacion(id_obligacion: int, datos: Obligacion):
         cursor.execute(
             "UPDATE obligaciones SET fecha_creacion = ?, tipo = ?, monto = ?, descripcion = ?, id_persona = ?, "
             "id_transaccion_origen = ?, id_movimiento_subcuenta_origen = ?, id_cuenta_destino_resolucion = ?, "
-            "id_subcuenta_destino_resolucion = ? OUTPUT INSERTED.* WHERE id_obligacion = ?",
+            "id_subcuenta_destino_resolucion = ? WHERE id_obligacion = ? RETURNING *",
             (datos.fecha_creacion, datos.tipo, monto, concepto, datos.id_persona, datos.id_transaccion_origen,
              datos.id_movimiento_subcuenta_origen, datos.id_cuenta_destino_resolucion,
              datos.id_subcuenta_destino_resolucion, id_obligacion),
@@ -1814,11 +1814,11 @@ def obtener_obligacion_detalle(id_obligacion: int):
 def _transacciones_recientes(limite=300):
     """Las ultimas transacciones con sus cuentas ya resueltas, para los selectores de vinculo."""
     recientes = fetch_all(
-        "SELECT TOP %d t.id_transaccion, t.fecha, t.tipo, t.monto, t.descripcion, "
+        "SELECT t.id_transaccion, t.fecha, t.tipo, t.monto, t.descripcion, "
         "origen.nombre AS cuenta_origen, destino.nombre AS cuenta_destino "
         "FROM transacciones t LEFT JOIN cuentas origen ON origen.id_cuenta = t.id_cuenta_origen "
         "LEFT JOIN cuentas destino ON destino.id_cuenta = t.id_cuenta_destino "
-        "ORDER BY t.fecha DESC, t.id_transaccion DESC" % limite
+        "ORDER BY t.fecha DESC, t.id_transaccion DESC LIMIT %d" % limite
     )
     for r in recientes:
         r["monto"] = _num(r["monto"])
@@ -1842,7 +1842,7 @@ def obtener_opciones_obligacion():
 
 @app.get("/liquidaciones")
 def listar_liquidaciones():
-    return fetch_all("SELECT * FROM liquidaciones_obligacion ORDER BY fecha DESC")
+    return fetch_all("SELECT * FROM liquidaciones_obligacion ORDER BY fecha DESC, id_liquidacion")
 
 
 @app.get("/liquidaciones/{id_liquidacion}")
@@ -2009,7 +2009,7 @@ def crear_liquidacion(liquidacion: LiquidacionObligacion):
                         id_movimiento, "El movimiento de subcuenta relacionado no existe.")
         cursor.execute(
             "INSERT INTO liquidaciones_obligacion (id_obligacion, fecha, monto, id_transaccion, "
-            "id_movimiento_subcuenta, descripcion) OUTPUT INSERTED.* VALUES (?, ?, ?, ?, ?, ?)",
+            "id_movimiento_subcuenta, descripcion) VALUES (?, ?, ?, ?, ?, ?) RETURNING *",
             (liquidacion.id_obligacion, liquidacion.fecha, monto, id_transaccion, id_movimiento, descripcion),
         )
         return fila_actual(cursor)
@@ -2087,7 +2087,7 @@ def actualizar_liquidacion(id_liquidacion: int, liquidacion: LiquidacionObligaci
     return run_returning(
         "UPDATE liquidaciones_obligacion SET id_obligacion = ?, fecha = ?, monto = ?, "
         "id_transaccion = ?, id_movimiento_subcuenta = ?, descripcion = ? "
-        "OUTPUT INSERTED.* WHERE id_liquidacion = ?",
+        "WHERE id_liquidacion = ? RETURNING *",
         (liquidacion.id_obligacion, liquidacion.fecha, liquidacion.monto,
          liquidacion.id_transaccion, liquidacion.id_movimiento_subcuenta, liquidacion.descripcion,
          id_liquidacion),
@@ -2159,7 +2159,7 @@ def _validar_financiamiento(cursor, datos):
 
 @app.get("/financiamientos")
 def listar_financiamientos():
-    return fetch_all("SELECT * FROM financiamientos ORDER BY fecha_inicio DESC")
+    return fetch_all("SELECT * FROM financiamientos ORDER BY fecha_inicio DESC, id_financiamiento")
 
 
 @app.get("/financiamientos/{id_financiamiento}")
@@ -2189,7 +2189,7 @@ def crear_financiamiento(datos: FinanciamientoNuevo):
         descripcion, monto, tasa = _validar_financiamiento(cursor, datos)
         cursor.execute(
             "INSERT INTO financiamientos (descripcion, fecha_inicio, monto_total, numero_cuotas, tasa_interes, "
-            "id_transaccion_origen) OUTPUT INSERTED.* VALUES (?, ?, ?, ?, ?, ?)",
+            "id_transaccion_origen) VALUES (?, ?, ?, ?, ?, ?) RETURNING *",
             (descripcion, datos.fecha_inicio, monto, datos.numero_cuotas, tasa, datos.id_transaccion_origen),
         )
         creado = fila_actual(cursor)
@@ -2210,7 +2210,7 @@ def actualizar_financiamiento(id_financiamiento: int, datos: Financiamiento):
         # Cambiar monto o numero de cuotas no reordena las cuotas que ya existen.
         cursor.execute(
             "UPDATE financiamientos SET descripcion = ?, fecha_inicio = ?, monto_total = ?, numero_cuotas = ?, "
-            "tasa_interes = ?, id_transaccion_origen = ? OUTPUT INSERTED.* WHERE id_financiamiento = ?",
+            "tasa_interes = ?, id_transaccion_origen = ? WHERE id_financiamiento = ? RETURNING *",
             (descripcion, datos.fecha_inicio, monto, datos.numero_cuotas, tasa, datos.id_transaccion_origen,
              id_financiamiento),
         )
@@ -2240,7 +2240,7 @@ def _financiamientos_detalle(id_financiamiento=None):
         "(SELECT COUNT(*) FROM cuotas_financiamiento q WHERE q.id_financiamiento = f.id_financiamiento) AS cuotas_total, "
         "(SELECT COUNT(*) FROM cuotas_financiamiento q WHERE q.id_financiamiento = f.id_financiamiento "
         "AND q.fecha_pago IS NOT NULL) AS cuotas_pagadas, "
-        "(SELECT ISNULL(SUM(q.monto), 0) FROM cuotas_financiamiento q WHERE q.id_financiamiento = f.id_financiamiento "
+        "(SELECT COALESCE(SUM(q.monto), 0) FROM cuotas_financiamiento q WHERE q.id_financiamiento = f.id_financiamiento "
         "AND q.fecha_pago IS NULL) AS monto_restante "
         "FROM financiamientos f "
         "LEFT JOIN transacciones t ON t.id_transaccion = f.id_transaccion_origen "
@@ -2291,9 +2291,9 @@ def obtener_financiamiento_detalle(id_financiamiento: int):
 def obtener_opciones_financiamiento():
     """Compras en tarjeta (candidatas a origen de un financiamiento) y transacciones recientes (para pagos)."""
     compras = fetch_all(
-        "SELECT TOP 100 t.id_transaccion, t.fecha, t.monto, t.descripcion, c.nombre AS tarjeta FROM transacciones t "
+        "SELECT t.id_transaccion, t.fecha, t.monto, t.descripcion, c.nombre AS tarjeta FROM transacciones t "
         "JOIN cuentas c ON c.id_cuenta = t.id_cuenta_origen WHERE c.tipo = 'TARJETA_CREDITO' AND t.tipo = 'GASTO' "
-        "ORDER BY t.fecha DESC, t.id_transaccion DESC"
+        "ORDER BY t.fecha DESC, t.id_transaccion DESC LIMIT 100"
     )
     for fila in compras:
         fila["monto"] = _num(fila["monto"])
@@ -2327,7 +2327,7 @@ def _validar_cuota(cursor, datos, id_cuota=None):
 
 @app.get("/cuotas-financiamiento")
 def listar_cuotas_financiamiento():
-    return fetch_all("SELECT * FROM cuotas_financiamiento ORDER BY fecha_vencimiento")
+    return fetch_all("SELECT * FROM cuotas_financiamiento ORDER BY fecha_vencimiento, id_cuota_financiamiento")
 
 
 @app.get("/cuotas-financiamiento/{id_cuota}")
@@ -2367,7 +2367,7 @@ def crear_cuota_financiamiento(cuota: CuotaFinanciamiento):
         monto = _validar_cuota(cursor, cuota)
         cursor.execute(
             "INSERT INTO cuotas_financiamiento (id_financiamiento, numero_cuota, fecha_vencimiento, monto) "
-            "OUTPUT INSERTED.* VALUES (?, ?, ?, ?)",
+            "VALUES (?, ?, ?, ?) RETURNING *",
             (cuota.id_financiamiento, cuota.numero_cuota, cuota.fecha_vencimiento, monto),
         )
         return fila_actual(cursor)
@@ -2383,7 +2383,7 @@ def actualizar_cuota_financiamiento(id_cuota: int, cuota: CuotaFinanciamiento):
         monto = _validar_cuota(cursor, cuota, id_cuota)
         cursor.execute(
             "UPDATE cuotas_financiamiento SET id_financiamiento = ?, numero_cuota = ?, fecha_vencimiento = ?, "
-            "monto = ? OUTPUT INSERTED.* WHERE id_cuota_financiamiento = ?",
+            "monto = ? WHERE id_cuota_financiamiento = ? RETURNING *",
             (cuota.id_financiamiento, cuota.numero_cuota, cuota.fecha_vencimiento, monto, id_cuota),
         )
         return fila_actual(cursor)
@@ -2413,7 +2413,7 @@ def _crear_transaccion_generada(cursor, fecha, tipo, monto, origen, destino, tex
         cursor.execute(
             "INSERT INTO transacciones "
             "(fecha, tipo, monto, id_cuenta_origen, id_cuenta_destino, id_categoria, descripcion, referencia) "
-            "OUTPUT INSERTED.id_transaccion VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING id_transaccion",
             (fecha, tipo, monto, origen, destino, categoria, descripcion, referencia),
         )
         id_transaccion = cursor.fetchone()[0]
@@ -2473,7 +2473,7 @@ def pagar_cuota_financiamiento(id_cuota: int, pago: PagoCuota):
         # Si se paga un monto distinto, la cuota queda con lo que realmente se pago.
         cursor.execute(
             "UPDATE cuotas_financiamiento SET fecha_pago = ?, id_transaccion_pago = ?, monto = ? "
-            "OUTPUT INSERTED.* WHERE id_cuota_financiamiento = ?",
+            "WHERE id_cuota_financiamiento = ? RETURNING *",
             (pago.fecha_pago, id_transaccion, monto, id_cuota),
         )
         return fila_actual(cursor)
@@ -2495,7 +2495,7 @@ def deshacer_pago_cuota(id_cuota: int, eliminar_pago: bool = False):
         id_transaccion = cuota[1]
         cursor.execute(
             "UPDATE cuotas_financiamiento SET fecha_pago = NULL, id_transaccion_pago = NULL "
-            "OUTPUT INSERTED.* WHERE id_cuota_financiamiento = ?",
+            "WHERE id_cuota_financiamiento = ? RETURNING *",
             (id_cuota,),
         )
         actualizada = fila_actual(cursor)
@@ -2609,14 +2609,14 @@ def _generar_ciclos(cursor, id_config):
             pares([arranque] + _inicios_nominales(dias, ajuste, arranque + timedelta(days=1), objetivo + timedelta(days=62)))
     for inicio, fin in nuevos:
         cursor.execute(
-            "INSERT INTO ciclo (id_ciclo_config, fecha_inicio, fecha_fin, ajustado) VALUES (?, ?, ?, 0)",
+            "INSERT INTO ciclo (id_ciclo_config, fecha_inicio, fecha_fin, ajustado) VALUES (?, ?, ?, FALSE)",
             (id_config, inicio, fin),
         )
 
 
 def _asegurar_ciclos():
     """Genera los ciclos que falten de todas las configuraciones activas."""
-    configs = fetch_all("SELECT id_ciclo_config FROM ciclo_config WHERE activo = 1")
+    configs = fetch_all("SELECT id_ciclo_config FROM ciclo_config WHERE activo = TRUE")
     if not configs:
         return
     with transaccion() as cursor:
@@ -2675,17 +2675,17 @@ def listar_config_ciclos():
 def crear_config_ciclos(datos: CicloConfig):
     with transaccion() as cursor:
         nombre, dias = _validar_config_ciclo(cursor, datos)
-        cursor.execute("SELECT COUNT(*) FROM ciclo_config WHERE es_principal = 1")
+        cursor.execute("SELECT COUNT(*) FROM ciclo_config WHERE es_principal = TRUE")
         sin_principal = cursor.fetchone()[0] == 0
         principal = datos.activo and (datos.es_principal or sin_principal)
         if datos.es_principal and not datos.activo:
             raise _rechazar(422, "La configuración principal debe estar activa.")
         if principal:
-            cursor.execute("UPDATE ciclo_config SET es_principal = 0 WHERE es_principal = 1")
+            cursor.execute("UPDATE ciclo_config SET es_principal = FALSE WHERE es_principal = TRUE")
         cursor.execute(
-            "INSERT INTO ciclo_config (nombre, ajuste_fin_semana, es_principal, activo) OUTPUT INSERTED.id_ciclo_config "
-            "VALUES (?, ?, ?, ?)",
-            (nombre, datos.ajuste_fin_semana, 1 if principal else 0, 1 if datos.activo else 0),
+            "INSERT INTO ciclo_config (nombre, ajuste_fin_semana, es_principal, activo) "
+            "VALUES (?, ?, ?, ?) RETURNING id_ciclo_config",
+            (nombre, datos.ajuste_fin_semana, bool(principal), bool(datos.activo)),
         )
         id_config = cursor.fetchone()[0]
         _guardar_dias(cursor, id_config, dias)
@@ -2704,11 +2704,11 @@ def actualizar_config_ciclos(id_config: int, datos: CicloConfig):
             raise _rechazar(422, "La configuración principal debe estar activa.")
         principal = anterior["es_principal"] or datos.es_principal
         if principal and not anterior["es_principal"]:
-            cursor.execute("UPDATE ciclo_config SET es_principal = 0 WHERE es_principal = 1")
+            cursor.execute("UPDATE ciclo_config SET es_principal = FALSE WHERE es_principal = TRUE")
         cursor.execute(
             "UPDATE ciclo_config SET nombre = ?, ajuste_fin_semana = ?, es_principal = ?, activo = ? "
             "WHERE id_ciclo_config = ?",
-            (nombre, datos.ajuste_fin_semana, 1 if principal else 0, 1 if datos.activo else 0, id_config),
+            (nombre, datos.ajuste_fin_semana, bool(principal), bool(datos.activo), id_config),
         )
         if dias != anterior["dias"] or datos.ajuste_fin_semana != anterior["ajuste_fin_semana"]:
             _guardar_dias(cursor, id_config, dias)
@@ -2729,16 +2729,16 @@ def eliminar_config_ciclos(id_config: int):
     return {"eliminado": True}
 
 
-def _ciclos_detalle(filtro, parametros, tope=""):
+def _ciclos_detalle(filtro, parametros, tope=None):
     hoy = date.today()
     ciclos = fetch_all(
-        "SELECT " + tope + " c.id_ciclo, c.id_ciclo_config, cfg.nombre AS config, c.fecha_inicio, c.fecha_fin, "
+        "SELECT c.id_ciclo, c.id_ciclo_config, cfg.nombre AS config, c.fecha_inicio, c.fecha_fin, "
         "c.ajustado, (SELECT p.id_ciclo FROM ciclo p WHERE p.id_ciclo_config = c.id_ciclo_config "
-        "AND p.fecha_fin = DATEADD(day, -1, c.fecha_inicio)) AS id_anterior, "
+        "AND p.fecha_fin = c.fecha_inicio - 1) AS id_anterior, "
         "(SELECT n.id_ciclo FROM ciclo n WHERE n.id_ciclo_config = c.id_ciclo_config "
-        "AND n.fecha_inicio = DATEADD(day, 1, c.fecha_fin)) AS id_siguiente "
+        "AND n.fecha_inicio = c.fecha_fin + 1) AS id_siguiente "
         "FROM ciclo c JOIN ciclo_config cfg ON cfg.id_ciclo_config = c.id_ciclo_config " + filtro +
-        "ORDER BY c.fecha_inicio DESC",
+        "ORDER BY c.fecha_inicio DESC" + (" LIMIT %d" % tope if tope else ""),
         parametros,
     )
     for c in ciclos:
@@ -2749,7 +2749,7 @@ def _ciclos_detalle(filtro, parametros, tope=""):
 
 
 def _config_principal():
-    fila = fetch_one("SELECT id_ciclo_config FROM ciclo_config WHERE es_principal = 1 AND activo = 1")
+    fila = fetch_one("SELECT id_ciclo_config FROM ciclo_config WHERE es_principal = TRUE AND activo = TRUE")
     return fila["id_ciclo_config"] if fila else None
 
 
@@ -2766,7 +2766,7 @@ def listar_ciclos(id_ciclo_config: Optional[int] = None, limite: int = 36):
     limite = min(max(limite, 1), 200)
     return {
         "config": config[0],
-        "ciclos": _ciclos_detalle("WHERE c.id_ciclo_config = ? ", (id_config,), "TOP %d" % limite),
+        "ciclos": _ciclos_detalle("WHERE c.id_ciclo_config = ? ", (id_config,), limite),
     }
 
 
@@ -2808,11 +2808,11 @@ def ajustar_ciclo(id_ciclo: int, datos: CicloAjuste):
             )
         if datos.fecha_inicio != inicio:
             cursor.execute(
-                "UPDATE ciclo SET fecha_inicio = ?, ajustado = 1 WHERE id_ciclo = ?", (datos.fecha_inicio, id_ciclo)
+                "UPDATE ciclo SET fecha_inicio = ?, ajustado = TRUE WHERE id_ciclo = ?", (datos.fecha_inicio, id_ciclo)
             )
             if previo:
                 cursor.execute(
-                    "UPDATE ciclo SET fecha_fin = ?, ajustado = 1 WHERE id_ciclo = ?",
+                    "UPDATE ciclo SET fecha_fin = ?, ajustado = TRUE WHERE id_ciclo = ?",
                     (datos.fecha_inicio - timedelta(days=1), previo[0]),
                 )
     return _ciclos_detalle("WHERE c.id_ciclo = ? ", (id_ciclo,))[0]
@@ -2856,9 +2856,9 @@ def _saldos_antes_de(fecha):
         "SUM(CASE WHEN cuentas.tipo = 'TARJETA_CREDITO' "
         "THEN salidas.total - entradas.total ELSE entradas.total - salidas.total END) AS saldo "
         "FROM cuentas "
-        "CROSS APPLY (SELECT ISNULL(SUM(monto), 0) AS total FROM transacciones "
+        "CROSS JOIN LATERAL (SELECT COALESCE(SUM(monto), 0) AS total FROM transacciones "
         "WHERE id_cuenta_destino = cuentas.id_cuenta AND fecha < ?) entradas "
-        "CROSS APPLY (SELECT ISNULL(SUM(monto), 0) AS total FROM transacciones "
+        "CROSS JOIN LATERAL (SELECT COALESCE(SUM(monto), 0) AS total FROM transacciones "
         "WHERE id_cuenta_origen = cuentas.id_cuenta AND fecha < ?) salidas "
         "GROUP BY cuentas.tipo",
         (fecha, fecha),
@@ -2960,7 +2960,7 @@ def _resumen_cuentas(cuentas):
 
 def _resumen_actividad(desde, hasta):
     return fetch_all(
-        "SELECT TOP %d t.id_transaccion, t.fecha, t.tipo, t.monto, t.descripcion, "
+        "SELECT t.id_transaccion, t.fecha, t.tipo, t.monto, t.descripcion, "
         "categorias.nombre AS categoria, origen.nombre AS cuenta_origen, "
         "destino.nombre AS cuenta_destino "
         "FROM transacciones t "
@@ -2968,7 +2968,7 @@ def _resumen_actividad(desde, hasta):
         "LEFT JOIN cuentas origen ON origen.id_cuenta = t.id_cuenta_origen "
         "LEFT JOIN cuentas destino ON destino.id_cuenta = t.id_cuenta_destino "
         "WHERE t.fecha >= ? AND t.fecha <= ? "
-        "ORDER BY t.fecha DESC, t.id_transaccion DESC" % MAX_ACTIVIDAD,
+        "ORDER BY t.fecha DESC, t.id_transaccion DESC LIMIT %d" % MAX_ACTIVIDAD,
         (desde, hasta),
     )
 
@@ -2981,7 +2981,7 @@ def _resumen_gastos(desde, hasta):
         "SELECT categorias.id_categoria, categorias.nombre, SUM(t.monto) AS total "
         "FROM transacciones t "
         "LEFT JOIN categorias ON categorias.id_categoria = t.id_categoria "
-        "WHERE t.tipo = 'GASTO' AND t.fecha >= ? AND t.fecha <= ? AND ISNULL(t.descripcion, '') <> ? "
+        "WHERE t.tipo = 'GASTO' AND t.fecha >= ? AND t.fecha <= ? AND COALESCE(t.descripcion, '') <> ? "
         "GROUP BY categorias.id_categoria, categorias.nombre ORDER BY total DESC",
         (desde, hasta, SALDO_INICIAL),
     )
@@ -3009,9 +3009,9 @@ def _totales_periodo(desde, hasta):
     """Ingresos y gastos entre dos fechas (inclusive). Los saldos iniciales, las transferencias y los pagos a
     tarjeta no cuentan: no son dinero que entra ni que se gasta."""
     fila = fetch_one(
-        "SELECT ISNULL(SUM(CASE WHEN tipo = 'INGRESO' THEN monto END), 0) AS ingresos, "
-        "ISNULL(SUM(CASE WHEN tipo = 'GASTO' THEN monto END), 0) AS gastos "
-        "FROM transacciones WHERE fecha >= ? AND fecha <= ? AND ISNULL(descripcion, '') <> ?",
+        "SELECT COALESCE(SUM(CASE WHEN tipo = 'INGRESO' THEN monto END), 0) AS ingresos, "
+        "COALESCE(SUM(CASE WHEN tipo = 'GASTO' THEN monto END), 0) AS gastos "
+        "FROM transacciones WHERE fecha >= ? AND fecha <= ? AND COALESCE(descripcion, '') <> ?",
         (desde, hasta, SALDO_INICIAL),
     )
     return fila["ingresos"], fila["gastos"]

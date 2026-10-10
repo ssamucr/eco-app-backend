@@ -28,10 +28,10 @@ def _rango(c):
 
 def _movimientos(ciclo):
     filas = fetch_all(
-        "SELECT TOP 5000 t.fecha, t.tipo, c.nombre AS categoria, t.descripcion, o.nombre AS origen, d.nombre AS destino, "
+        "SELECT t.fecha, t.tipo, c.nombre AS categoria, t.descripcion, o.nombre AS origen, d.nombre AS destino, "
         "t.monto, t.referencia FROM transacciones t LEFT JOIN categorias c ON c.id_categoria = t.id_categoria "
         "LEFT JOIN cuentas o ON o.id_cuenta = t.id_cuenta_origen LEFT JOIN cuentas d ON d.id_cuenta = t.id_cuenta_destino "
-        "WHERE t.fecha >= ? AND t.fecha <= ? ORDER BY t.fecha DESC, t.id_transaccion DESC",
+        "WHERE t.fecha >= ? AND t.fecha <= ? ORDER BY t.fecha DESC, t.id_transaccion DESC LIMIT 5000",
         (ciclo["fecha_inicio"], ciclo["fecha_fin"]),
     )
     return filas

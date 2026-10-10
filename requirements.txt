@@ -1,6 +1,6 @@
 fastapi
 uvicorn[standard]
-pyodbc
+psycopg2-binary>=2.9.9,<3
 pydantic
 openpyxl
 reportlab>=4.1,<4.3

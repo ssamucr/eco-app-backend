@@ -39,7 +39,7 @@ def _dinero_texto(valor):
 
 
 def _sin_saldo_inicial():
-    return "ISNULL(t.descripcion, '') <> '%s'" % SALDO_INICIAL
+    return "COALESCE(t.descripcion, '') <> '%s'" % SALDO_INICIAL
 
 
 # ---------- periodo e historial ----------
@@ -80,7 +80,7 @@ def _ciclos_del_historial(ciclo, cantidad, hoy):
     if ciclo["id_ciclo_config"] is not None:
         filas = _ciclos_detalle(
             "WHERE c.id_ciclo_config = ? AND c.fecha_inicio <= ? ",
-            (ciclo["id_ciclo_config"], ciclo["fecha_inicio"]), "TOP %d" % cantidad,
+            (ciclo["id_ciclo_config"], ciclo["fecha_inicio"]), cantidad,
         )
         return list(reversed(filas))
     return _meses_atras(ciclo["fecha_inicio"], cantidad - 1) + [dict(ciclo, es_actual=ciclo["fecha_inicio"] <= hoy <= ciclo["fecha_fin"])]
@@ -117,7 +117,7 @@ def _metricas_ciclo(c, hoy, primera):
 
 def _gastos_por_categoria(desde, hasta):
     filas = fetch_all(
-        "SELECT c.id_categoria, ISNULL(c.nombre, 'Sin categoría') AS nombre, SUM(t.monto) AS total "
+        "SELECT c.id_categoria, COALESCE(c.nombre, 'Sin categoría') AS nombre, SUM(t.monto) AS total "
         "FROM transacciones t LEFT JOIN categorias c ON c.id_categoria = t.id_categoria "
         "WHERE t.tipo = 'GASTO' AND t.fecha >= ? AND t.fecha <= ? AND " + _sin_saldo_inicial() + " "
         "GROUP BY c.id_categoria, c.nombre",
@@ -152,11 +152,11 @@ def _categorias(ciclo, anterior, comparables):
 
 def _mayores_gastos(ciclo):
     filas = fetch_all(
-        "SELECT TOP 10 t.id_transaccion, t.fecha, t.descripcion, t.monto, c.nombre AS categoria, o.nombre AS cuenta "
+        "SELECT t.id_transaccion, t.fecha, t.descripcion, t.monto, c.nombre AS categoria, o.nombre AS cuenta "
         "FROM transacciones t LEFT JOIN categorias c ON c.id_categoria = t.id_categoria "
         "LEFT JOIN cuentas o ON o.id_cuenta = t.id_cuenta_origen "
         "WHERE t.tipo = 'GASTO' AND t.fecha >= ? AND t.fecha <= ? AND " + _sin_saldo_inicial() + " "
-        "ORDER BY t.monto DESC, t.fecha DESC",
+        "ORDER BY t.monto DESC, t.fecha DESC LIMIT 10",
         (ciclo["fecha_inicio"], ciclo["fecha_fin"]),
     )
     for f in filas:
@@ -182,15 +182,15 @@ def _gastos_por_cuenta(ciclo, total):
 
 def _hormiga(ciclo, total):
     fila = fetch_one(
-        "SELECT COUNT(*) AS cantidad, ISNULL(SUM(t.monto), 0) AS total FROM transacciones t "
+        "SELECT COUNT(*) AS cantidad, COALESCE(SUM(t.monto), 0) AS total FROM transacciones t "
         "WHERE t.tipo = 'GASTO' AND t.monto <= ? AND t.fecha >= ? AND t.fecha <= ? AND " + _sin_saldo_inicial(),
         (UMBRAL_HORMIGA, ciclo["fecha_inicio"], ciclo["fecha_fin"]),
     )
-    descripcion = "ISNULL(NULLIF(LTRIM(RTRIM(t.descripcion)), ''), 'Sin descripción')"
+    descripcion = "COALESCE(NULLIF(BTRIM(t.descripcion), ''), 'Sin descripción')"
     detalle = fetch_all(
-        "SELECT TOP 6 " + descripcion + " AS descripcion, COUNT(*) AS veces, SUM(t.monto) AS total FROM transacciones t "
+        "SELECT " + descripcion + " AS descripcion, COUNT(*) AS veces, SUM(t.monto) AS total FROM transacciones t "
         "WHERE t.tipo = 'GASTO' AND t.monto <= ? AND t.fecha >= ? AND t.fecha <= ? AND " + _sin_saldo_inicial() + " "
-        "GROUP BY " + descripcion + " ORDER BY SUM(t.monto) DESC",
+        "GROUP BY " + descripcion + " ORDER BY SUM(t.monto) DESC LIMIT 6",
         (UMBRAL_HORMIGA, ciclo["fecha_inicio"], ciclo["fecha_fin"]),
     )
     return {
@@ -359,7 +359,7 @@ def _metas(cuentas, historial, hoy, primera, historia_suficiente):
         for f in fetch_all(
             "SELECT d.id_subcuenta_destino AS id, d.monto, p.nombre AS nombre_plan FROM plan_recurrente_destinos d "
             "JOIN plan_recurrente p ON p.id_plan = d.id_plan "
-            "WHERE p.activo = 1 AND d.activo = 1 AND d.monto IS NOT NULL AND d.id_subcuenta_destino IS NOT NULL"
+            "WHERE p.activo AND d.activo AND d.monto IS NOT NULL AND d.id_subcuenta_destino IS NOT NULL"
         )
     }
     # lo que entra a la subcuenta sin ser saldo inicial, ajuste ni un pago del plan ("<plan>: <subcuenta>")
@@ -368,9 +368,9 @@ def _metas(cuentas, historial, hoy, primera, historia_suficiente):
         for f in fetch_all(
             "SELECT m.id_subcuenta_destino AS id, SUM(m.monto) AS total FROM movimientos_subcuenta m "
             "WHERE m.id_subcuenta_destino IS NOT NULL AND m.fecha >= ? AND m.fecha <= ? "
-            "AND ISNULL(m.descripcion, '') NOT IN (?, ?) "
+            "AND COALESCE(m.descripcion, '') NOT IN (?, ?) "
             "AND NOT EXISTS (SELECT 1 FROM plan_recurrente p "
-            "WHERE LEFT(ISNULL(m.descripcion, ''), LEN(p.nombre) + 2) = p.nombre + ': ') "
+            "WHERE LEFT(COALESCE(m.descripcion, ''), LENGTH(p.nombre) + 2) = p.nombre || ': ') "
             "GROUP BY m.id_subcuenta_destino",
             (desde, hasta) + DESCRIPCIONES_SIN_APORTE,
         )
@@ -411,16 +411,16 @@ def _deuda(cuentas, hoy):
         for c in cuentas if c["tipo"] == TARJETA
     ]
     cuotas = fetch_all(
-        "SELECT TOP 8 q.id_cuota_financiamiento, f.id_financiamiento, f.descripcion, q.numero_cuota, f.numero_cuotas, "
+        "SELECT q.id_cuota_financiamiento, f.id_financiamiento, f.descripcion, q.numero_cuota, f.numero_cuotas, "
         "q.fecha_vencimiento, q.monto FROM cuotas_financiamiento q "
         "JOIN financiamientos f ON f.id_financiamiento = q.id_financiamiento "
-        "WHERE q.fecha_pago IS NULL ORDER BY q.fecha_vencimiento, q.numero_cuota"
+        "WHERE q.fecha_pago IS NULL ORDER BY q.fecha_vencimiento, q.numero_cuota LIMIT 8"
     )
     for q in cuotas:
         q["monto"] = _num(q["monto"])
         q["dias_para_vencer"] = (q["fecha_vencimiento"] - hoy).days
     restante = fetch_one(
-        "SELECT ISNULL(SUM(monto), 0) AS total, COUNT(*) AS cuotas FROM cuotas_financiamiento WHERE fecha_pago IS NULL"
+        "SELECT COALESCE(SUM(monto), 0) AS total, COUNT(*) AS cuotas FROM cuotas_financiamiento WHERE fecha_pago IS NULL"
     )
     return {
         "tarjetas": tarjetas, "cuotas_proximas": cuotas,
