@@ -38,7 +38,14 @@ from schemas import (
 )
 
 # Toda ruta exige un usuario autenticado (ver auth.py), salvo /health.
-app = FastAPI(dependencies=[Depends(exigir_usuario)])
+# La documentacion interactiva (/docs) solo se publica en desarrollo local (o con ECO_DOCS_ACTIVAS=1).
+_docs = os.environ.get("ECO_AUTH_DESACTIVADA") == "1" or os.environ.get("ECO_DOCS_ACTIVAS") == "1"
+app = FastAPI(
+    dependencies=[Depends(exigir_usuario)],
+    docs_url="/docs" if _docs else None,
+    redoc_url=None,
+    openapi_url="/openapi.json" if _docs else None,
+)
 
 # Origenes del front permitidos: ECO_CORS_ORIGENES separados por coma (por defecto, el servidor de desarrollo).
 app.add_middleware(
