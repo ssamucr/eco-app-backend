@@ -1,0 +1,22 @@
+# Supabase (plan gratis) pausa los proyectos tras 7 dias sin actividad. Este aviso consulta la API cada 3 dias:
+# la API consulta la base, asi que cuenta como actividad. No envia ni lee datos (solo /health).
+name: Mantener activo
+
+on:
+  schedule:
+    - cron: "17 13 */3 * *"
+  workflow_dispatch:
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Consultar /health (con reintentos: Render gratis tarda en despertar)
+        run: |
+          for i in 1 2 3 4 5; do
+            codigo=$(curl -s -o /dev/null -w "%{http_code}" --max-time 120 https://eco-api-cyyb.onrender.com/health || true)
+            echo "intento $i: HTTP $codigo"
+            [ "$codigo" = "200" ] && exit 0
+            sleep 30
+          done
+          exit 1
