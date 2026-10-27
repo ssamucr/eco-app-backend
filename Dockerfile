@@ -1,6 +1,12 @@
 FROM python:3.12-slim
 
 WORKDIR /app
+
+# Certificados raiz al dia (aviso de Render sobre los intermedios de eMudhra, oct 2026).
+RUN apt-get update \
+    && apt-get install -y --only-upgrade ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
 ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1
 
 COPY requirements.txt .
