@@ -11,7 +11,7 @@ jobs:
   ping:
     runs-on: ubuntu-latest
     steps:
-      - name: Consultar /health (con reintentos: Render gratis tarda en despertar)
+      - name: "Consultar /health (con reintentos, Render gratis tarda en despertar)"
         run: |
           for i in 1 2 3 4 5; do
             codigo=$(curl -s -o /dev/null -w "%{http_code}" --max-time 120 https://eco-api-cyyb.onrender.com/health || true)
