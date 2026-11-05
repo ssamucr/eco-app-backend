@@ -253,6 +253,44 @@ def registrar(mcp, api, config):
         return await transaccion(cuerpo, origen, destino, texto, confirmar, permitir_duplicado)
 
     @mcp.tool(annotations=ESCRITURA)
+    async def asignar_a_subcuenta(
+        cuenta: Annotated[str, Field(description="Cuenta que tiene el saldo sin asignar (nombre o id).")],
+        subcuenta: Annotated[str, Field(description="Subcuenta de esa cuenta que recibe el dinero (nombre o id).")],
+        monto: Monto,
+        descripcion: Descripcion = None,
+        fecha: Annotated[Optional[str], Field(description="AAAA-MM-DD. Si se omite, hoy.")] = None,
+        confirmar: Confirmar = False,
+    ):
+        """Asigna a una subcuenta dinero que está sin asignar en su misma cuenta (por ejemplo un interés recién
+        acreditado). No mueve dinero entre cuentas. Primero devuelve una vista previa; solo guarda con confirmar=true."""
+        cuentas, _, _ = await catalogos()
+        elegida = cuenta_por(cuenta, cuentas, excluir_tipos=("TARJETA_CREDITO",))
+        if not elegida["subcuentas"]:
+            raise ToolError("«%s» no tiene subcuentas." % elegida["nombre"])
+        id_sub = elegir(subcuenta, [(x["id_subcuenta"], x["nombre"]) for x in elegida["subcuentas"]],
+                        "las subcuentas de «%s»" % elegida["nombre"])
+        destino = next(x for x in elegida["subcuentas"] if x["id_subcuenta"] == id_sub)
+        disponible = float(elegida.get("sin_asignar") or 0)
+        if monto > disponible + 0.005:
+            raise ToolError("En «%s» solo hay %s sin asignar." % (elegida["nombre"], _dolares(max(disponible, 0))))
+        cuerpo = {
+            "fecha": fecha_valida(fecha, "fecha") or hoy(), "tipo": "ASIGNACION", "monto": monto,
+            "id_subcuenta_destino": id_sub, "descripcion": descripcion,
+        }
+        texto = "Asignación de %s del saldo sin asignar de «%s» a la subcuenta «%s» el %s; quedarían %s sin asignar y «%s» en %s" % (
+            _dolares(monto), elegida["nombre"], destino["nombre"], cuerpo["fecha"], _dolares(max(disponible - monto, 0)),
+            destino["nombre"], _dolares(float(destino.get("saldo") or 0) + monto),
+        )
+        if descripcion:
+            texto += " — «%s»" % descripcion
+        if not confirmar:
+            return {"estado": "vista_previa", "se_registrara": texto,
+                    "siguiente_paso": "Muestra este resumen al usuario. Si lo aprueba, repite la llamada con confirmar=true."}
+        creada = await api.crear("/movimientos-subcuenta", cuerpo)
+        anotar("asignacion", "id=%s %s" % (creada.get("id_movimiento_subcuenta"), texto))
+        return {"estado": "registrado", "id_movimiento_subcuenta": creada.get("id_movimiento_subcuenta"), "registrado": texto}
+
+    @mcp.tool(annotations=ESCRITURA)
     async def crear_obligacion(
         tipo: Annotated[
             Literal["POR_COBRAR", "POR_PAGAR"],

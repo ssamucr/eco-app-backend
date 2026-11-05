@@ -44,6 +44,7 @@ Escritura (todas en dos pasos: sin `confirmar` solo muestran una vista previa; c
 cuentas y descripción) se rechaza para evitar duplicados por reintentos, salvo `permitir_duplicado=true`.
 `registrar_gasto` acepta `generar_reposicion=true` en gastos de tarjeta: crea además la obligación de reposición por el
 mismo monto (se salda luego con `liquidar_obligacion`, pagando la tarjeta desde una cuenta).
+`asignar_a_subcuenta` reparte saldo sin asignar de una cuenta (p. ej. un interés) a una de sus subcuentas; no mueve dinero entre cuentas.
 
 ## Variables de entorno
 

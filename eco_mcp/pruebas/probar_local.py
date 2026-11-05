@@ -122,6 +122,40 @@ async def probar_resto(cliente):
         "descripcion": "prueba pago", "confirmar": True}))
     comprobar(r["estado"] == "registrado", "pago de tarjeta registrado")
 
+    # Asignar saldo sin asignar a una subcuenta: primero se acredita un ingreso chico y luego se asigna.
+    r = datos(await cliente.call_tool("registrar_ingreso", {
+        "cuenta": con_sub["nombre"], "monto": 0.02, "descripcion": "prueba interes", "fecha": fecha, "confirmar": True}))
+    comprobar(r["estado"] == "registrado", "ingreso de prueba para asignar")
+
+    def saldo_sub():
+        cuenta_actual = next(c for c in api("GET", "/cuentas-detalle")["ahorro"]["cuentas"] if c["nombre"] == con_sub["nombre"])
+        return next(x["saldo"] for x in cuenta_actual["subcuentas"] if x["nombre"] == sub["nombre"]), cuenta_actual["sin_asignar"]
+
+    saldo_antes, libre_antes = saldo_sub()
+    v = datos(await cliente.call_tool("asignar_a_subcuenta", {
+        "cuenta": con_sub["nombre"], "subcuenta": sub["nombre"], "monto": 0.02, "fecha": fecha}))
+    comprobar(v["estado"] == "vista_previa" and sub["nombre"] in v["se_registrara"], "asignacion: vista previa")
+    comprobar(saldo_sub() == (saldo_antes, libre_antes), "la vista previa no mueve saldos")
+    r = datos(await cliente.call_tool("asignar_a_subcuenta", {
+        "cuenta": con_sub["nombre"], "subcuenta": sub["nombre"], "monto": 0.02, "fecha": fecha,
+        "descripcion": "prueba asignacion", "confirmar": True}))
+    comprobar(r["estado"] == "registrado" and r["id_movimiento_subcuenta"], "asignacion registrada")
+    saldo_despues, libre_despues = saldo_sub()
+    comprobar(abs(saldo_despues - saldo_antes - 0.02) < 0.001 and abs(libre_antes - libre_despues - 0.02) < 0.001,
+              "la subcuenta sube y lo sin asignar baja")
+    try:
+        await cliente.call_tool("asignar_a_subcuenta", {
+            "cuenta": con_sub["nombre"], "subcuenta": sub["nombre"], "monto": 9999, "confirmar": True})
+        comprobar(False, "asignar mas de lo sin asignar debe rechazarse")
+    except ToolError as e:
+        comprobar("sin asignar" in str(e), "asignar mas de lo sin asignar -> rechazado")
+    try:
+        await cliente.call_tool("asignar_a_subcuenta", {
+            "cuenta": tarjeta, "subcuenta": sub["nombre"], "monto": 0.01, "confirmar": True})
+        comprobar(False, "asignar en una tarjeta debe rechazarse")
+    except ToolError:
+        comprobar(True, "asignar en una tarjeta rechazado")
+
     v = datos(await cliente.call_tool("crear_obligacion", {
         "tipo": "POR_COBRAR", "persona": persona, "monto": 0.05, "concepto": "prueba obligacion",
         "cuenta_de_liquidacion": otra["nombre"], "fecha": fecha}))
@@ -158,8 +192,8 @@ async def main():
         lectura = ["resumen", "cuentas", "movimientos", "analitica", "ciclos", "obligaciones",
                    "planes_recurrentes", "financiamientos", "catalogos"]
         escritura = ["registrar_gasto", "registrar_ingreso", "registrar_transferencia", "pagar_tarjeta",
-                     "crear_obligacion", "liquidar_obligacion"]
-        comprobar(set(lectura + escritura) == set(herramientas), "estan exactamente las 15 herramientas previstas")
+                     "crear_obligacion", "liquidar_obligacion", "asignar_a_subcuenta"]
+        comprobar(set(lectura + escritura) == set(herramientas), "estan exactamente las 16 herramientas previstas")
         comprobar(all(herramientas[n].annotations.read_only_hint for n in lectura), "las de lectura son readOnly")
         comprobar(all(not herramientas[n].annotations.read_only_hint and not herramientas[n].annotations.destructive_hint
                       for n in escritura), "las de escritura no son readOnly ni destructivas")
