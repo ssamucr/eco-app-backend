@@ -128,6 +128,13 @@ def registrar(mcp, api, config):
             Optional[str],
             Field(description="Subcuenta de esa cuenta de la que se toma el dinero. Si se omite, sale de lo sin asignar."),
         ] = None,
+        generar_reposicion: Annotated[
+            bool,
+            Field(
+                description="Solo para gastos con tarjeta de crédito: además crea la obligación de reposición por el mismo "
+                "monto, que luego se salda pagando la tarjeta desde una cuenta (ver `liquidar_obligacion`)."
+            ),
+        ] = False,
         confirmar: Confirmar = False,
         permitir_duplicado: Duplicado = False,
     ):
@@ -146,6 +153,11 @@ def registrar(mcp, api, config):
             texto += ", categoría «%s»" % next(c["nombre"] for c in categorias if c["id_categoria"] == cuerpo["id_categoria"])
         if descripcion:
             texto += " — «%s»" % descripcion
+        if generar_reposicion:
+            if origen["tipo"] != "TARJETA_CREDITO":
+                raise ToolError("Solo un gasto con tarjeta de crédito puede generar una obligación de reposición.")
+            cuerpo["obligacion"] = {"tipo": "REPOSICION", "id_cuenta_destino_resolucion": origen["id_cuenta"]}
+            texto += "; genera una obligación de reposición por %s a saldar en «%s»" % (_dolares(monto), origen["nombre"])
         return await transaccion(cuerpo, origen, None, texto, confirmar, permitir_duplicado)
 
     @mcp.tool(annotations=ESCRITURA)

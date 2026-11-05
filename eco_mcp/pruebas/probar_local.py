@@ -77,6 +77,29 @@ async def probar_resto(cliente):
         "cuenta": tarjeta, "monto": 0.02, "descripcion": "prueba gasto tarjeta", "fecha": fecha, "confirmar": True}))
     comprobar(r["estado"] == "registrado", "gasto con tarjeta registrado")
 
+    antes_ob = set(estado()["obligaciones"])
+    v = datos(await cliente.call_tool("registrar_gasto", {
+        "cuenta": tarjeta, "monto": 0.03, "descripcion": "prueba reposicion", "fecha": fecha, "generar_reposicion": True}))
+    comprobar(v["estado"] == "vista_previa" and "reposición" in v["se_registrara"], "gasto con reposicion: vista previa")
+    comprobar(set(estado()["obligaciones"]) == antes_ob, "la vista previa no crea la obligacion")
+    r = datos(await cliente.call_tool("registrar_gasto", {
+        "cuenta": tarjeta, "monto": 0.03, "descripcion": "prueba reposicion", "fecha": fecha,
+        "generar_reposicion": True, "confirmar": True}))
+    comprobar(r["estado"] == "registrado", "gasto con reposicion registrado")
+    nuevas = [o for o in api("GET", "/obligaciones-detalle")["reposiciones"] if o["id_obligacion"] not in antes_ob]
+    comprobar(
+        len(nuevas) == 1 and nuevas[0]["tipo"] == "REPOSICION" and abs(nuevas[0]["monto"] - 0.03) < 0.001
+        and nuevas[0]["cuenta_destino"] == tarjeta and nuevas[0]["id_transaccion_origen"] == r["id_transaccion"]
+        and nuevas[0]["concepto"] == "prueba reposicion",
+        "creo la obligacion de reposicion hacia la tarjeta, ligada al gasto",
+    )
+    try:
+        await cliente.call_tool("registrar_gasto", {
+            "cuenta": otra["nombre"], "monto": 0.03, "fecha": fecha, "generar_reposicion": True, "confirmar": True})
+        comprobar(False, "reposicion en cuenta que no es tarjeta debe rechazarse")
+    except ToolError:
+        comprobar(True, "reposicion en cuenta que no es tarjeta rechazada")
+
     r = datos(await cliente.call_tool("registrar_transferencia", {
         "cuenta_origen": con_sub["nombre"], "cuenta_destino": otra["nombre"], "monto": 0.01,
         "subcuenta_origen": sub["nombre"], "descripcion": "prueba transf", "fecha": fecha, "confirmar": True}))

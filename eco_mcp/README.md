@@ -42,6 +42,8 @@ Escritura (todas en dos pasos: sin `confirmar` solo muestran una vista previa; c
 `registrar_gasto`, `registrar_ingreso`, `registrar_transferencia`, `pagar_tarjeta`, `crear_obligacion`,
 `liquidar_obligacion`. No hay herramientas para borrar ni editar. Un movimiento idéntico (mismo día, tipo, monto,
 cuentas y descripción) se rechaza para evitar duplicados por reintentos, salvo `permitir_duplicado=true`.
+`registrar_gasto` acepta `generar_reposicion=true` en gastos de tarjeta: crea además la obligación de reposición por el
+mismo monto (se salda luego con `liquidar_obligacion`, pagando la tarjeta desde una cuenta).
 
 ## Variables de entorno
 
