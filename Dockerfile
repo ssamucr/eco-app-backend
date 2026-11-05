@@ -14,5 +14,6 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-# Render define PORT; en local se usa 8000.
-CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000}"]
+# Render define PORT; en local se usa 8000. eco_mcp.asgi sirve la API de siempre y, aparte, el MCP en /mcp
+# (si falta su configuracion, sirve solo la API).
+CMD ["sh", "-c", "uvicorn eco_mcp.asgi:app --host 0.0.0.0 --port ${PORT:-8000}"]
